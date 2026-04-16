@@ -147,15 +147,31 @@ info "Binary built: ${SCRIPT_DIR}/webex-scribe"
 # 5. Authenticate with Google
 # --------------------------------------------------------------------------- #
 
-echo ""
-echo "============================================================"
-echo " Google Authentication"
-echo "============================================================"
-echo " The next command will open a browser so you can log in"
-echo " with your Google account and grant Drive/Docs access."
-echo ""
-read -rp "Press Enter to authenticate with Google (Ctrl-C to skip)..."
-gcloud auth login --enable-gdrive-access
+# Check if already logged in with Drive access by trying to list Drive files.
+GCLOUD_AUTHED=false
+if gcloud auth list --filter="status=ACTIVE" --format="value(account)" 2>/dev/null | grep -q '@'; then
+    # Verify the active account actually has Drive access (not just gcloud access).
+    if gcloud auth print-access-token 2>/dev/null | xargs -I{} curl -sf \
+        -H "Authorization: Bearer {}" \
+        "https://www.googleapis.com/drive/v3/about?fields=user" > /dev/null 2>&1; then
+        GCLOUD_AUTHED=true
+    fi
+fi
+
+if [[ "${GCLOUD_AUTHED}" == "true" ]]; then
+    ACTIVE_ACCOUNT="$(gcloud auth list --filter="status=ACTIVE" --format="value(account)" 2>/dev/null | head -1)"
+    info "Already authenticated with Google as ${ACTIVE_ACCOUNT} — skipping login."
+else
+    echo ""
+    echo "============================================================"
+    echo " Google Authentication"
+    echo "============================================================"
+    echo " The next command will open a browser so you can log in"
+    echo " with your Google account and grant Drive/Docs access."
+    echo ""
+    read -rp "Press Enter to authenticate with Google (Ctrl-C to skip)..."
+    gcloud auth login --enable-gdrive-access
+fi
 
 # --------------------------------------------------------------------------- #
 # Done
