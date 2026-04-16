@@ -46,6 +46,9 @@ type manifestEntry struct {
 	// Title is the meeting title as returned by the Webex API.
 	Title string `json:"title"`
 
+	// MeetingDate is the UTC start date of the meeting (YYYY-MM-DD).
+	MeetingDate string `json:"meetingDate,omitempty"`
+
 	// UploadedAt records when this entry was last written.
 	UploadedAt time.Time `json:"uploadedAt"`
 }
@@ -167,6 +170,7 @@ func (dm *driveManifest) record(ctx context.Context, t Transcript, transcriptURL
 		TranscriptURL: transcriptURL,
 		SummaryURL:    summaryURL,
 		Title:         t.MeetingTitle,
+		MeetingDate:   t.StartTime.UTC().Format("2006-01-02"),
 		UploadedAt:    time.Now().UTC(),
 	}
 	return dm.save(ctx)
