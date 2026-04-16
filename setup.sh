@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# setup.sh - Install dependencies and build webex-transcript-sync.
+# setup.sh - Install dependencies and build webex-scribe.
 #
 # Installs:
-#   - Google Cloud SDK (gcloud) via the official apt repository
+#   - Google Cloud SDK (gcloud) via the official package manager
 #   - Go 1.22+ if not already present
 # Then builds the binary and prompts for Google authentication.
 #
-# Tested on Ubuntu 20.04, 22.04, and 24.04 (Debian-based distros).
+# Tested on Ubuntu 20.04, 22.04, 24.04 and macOS (Homebrew).
 
 set -euo pipefail
 
@@ -24,27 +24,45 @@ require_sudo() {
     fi
 }
 
+# Detect OS
+OS="$(uname -s)"
+
 # --------------------------------------------------------------------------- #
 # 1. Check OS
 # --------------------------------------------------------------------------- #
 
-if [[ ! -f /etc/debian_version ]]; then
-    die "This script supports Debian/Ubuntu only. Install gcloud manually from https://cloud.google.com/sdk/docs/install"
-fi
+case "${OS}" in
+    Linux)
+        if [[ ! -f /etc/debian_version ]]; then
+            die "Linux support is Debian/Ubuntu only. Install gcloud manually: https://cloud.google.com/sdk/docs/install"
+        fi
+        ;;
+    Darwin)
+        if ! command -v brew &>/dev/null; then
+            die "Homebrew is required on macOS. Install it from https://brew.sh then re-run this script."
+        fi
+        ;;
+    *)
+        die "Unsupported OS: ${OS}. Install dependencies manually."
+        ;;
+esac
 
 # --------------------------------------------------------------------------- #
 # 2. Install Go (if missing or too old; minimum 1.22)
 # --------------------------------------------------------------------------- #
 
 MIN_GO_MINOR=22
-REQUIRED_GO="go1.${MIN_GO_MINOR}"
 
-install_go() {
-    GO_VERSION="1.23.6"
-    GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
-    GO_URL="https://go.dev/dl/${GO_TARBALL}"
+install_go_linux() {
+    local GO_VERSION="1.23.6"
+    local ARCH
+    ARCH="$(uname -m)"
+    local GO_ARCH="amd64"
+    [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]] && GO_ARCH="arm64"
+    local GO_TARBALL="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+    local GO_URL="https://go.dev/dl/${GO_TARBALL}"
 
-    info "Downloading Go ${GO_VERSION}..."
+    info "Downloading Go ${GO_VERSION} (linux/${GO_ARCH})..."
     curl -fsSL "${GO_URL}" -o "/tmp/${GO_TARBALL}"
 
     info "Installing Go ${GO_VERSION} to /usr/local/go ..."
@@ -52,26 +70,32 @@ install_go() {
     sudo tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
     rm "/tmp/${GO_TARBALL}"
 
-    # Ensure /usr/local/go/bin is on PATH for the rest of this script.
     export PATH="/usr/local/go/bin:${PATH}"
     info "Go $(go version) installed."
 }
 
+install_go_mac() {
+    info "Installing Go via Homebrew..."
+    brew install go
+    export PATH="$(brew --prefix go)/bin:${PATH}"
+    info "Go $(go version) installed."
+}
+
 if command -v go &>/dev/null; then
-    # Extract the minor version number, e.g. "1.23.6" -> 23
-    CURRENT_MINOR=$(go version | grep -oP 'go1\.\K[0-9]+')
+    # grep -oP is GNU grep; macOS needs a different approach
+    CURRENT_MINOR=$(go version | sed -E 's/.*go1\.([0-9]+).*/\1/')
     if (( CURRENT_MINOR < MIN_GO_MINOR )); then
         warn "Go 1.${CURRENT_MINOR} is too old (need >= 1.${MIN_GO_MINOR}). Upgrading..."
-        install_go
+        [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
     else
         info "Go $(go version) found — OK."
     fi
 else
     info "Go not found. Installing..."
-    install_go
+    [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
 fi
 
-# Make sure go is on PATH for subsequent steps (already set if we just installed).
+# Make sure go is on PATH for subsequent steps.
 export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
 
 # --------------------------------------------------------------------------- #
@@ -82,21 +106,28 @@ if command -v gcloud &>/dev/null; then
     info "gcloud $(gcloud version --format='value(Google Cloud SDK)' 2>/dev/null || echo '') found — OK."
 else
     info "Installing Google Cloud SDK..."
-    require_sudo
 
-    # Add the Google Cloud apt repository.
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq apt-transport-https ca-certificates gnupg curl
+    if [[ "${OS}" == "Darwin" ]]; then
+        info "Installing via Homebrew..."
+        brew install --cask google-cloud-sdk
+        # Homebrew cask doesn't modify PATH; source the profile if present.
+        GCLOUD_BREW_PATH="$(brew --prefix)/share/google-cloud-sdk/bin"
+        export PATH="${GCLOUD_BREW_PATH}:${PATH}"
+    else
+        require_sudo
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq apt-transport-https ca-certificates gnupg curl
 
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-        | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
 
-    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
 https://packages.cloud.google.com/apt cloud-sdk main" \
-        | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null
+            | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null
 
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq google-cloud-cli
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq google-cloud-cli
+    fi
 
     info "gcloud installed: $(gcloud version --format='value(Google Cloud SDK)' 2>/dev/null)"
 fi
@@ -108,9 +139,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-info "Building webex-transcript-sync..."
-go build -o webex-transcript-sync .
-info "Binary built: ${SCRIPT_DIR}/webex-transcript-sync"
+info "Building webex-scribe..."
+go build -o webex-scribe .
+info "Binary built: ${SCRIPT_DIR}/webex-scribe"
 
 # --------------------------------------------------------------------------- #
 # 5. Authenticate with Google
@@ -135,17 +166,13 @@ echo "============================================================"
 echo " Setup complete!"
 echo "============================================================"
 echo ""
-echo " Next step: create a Webex OAuth2 integration at"
-echo "   https://developer.webex.com → My Apps → Create a New App"
+echo " Run the app — it will prompt for your Webex Personal Access Token"
+echo " on first use (valid for 12 hours, saved to ~/.webex-meeting-sync/.env):"
 echo ""
-echo " Redirect URI : http://localhost:47823/callback"
-echo " Scopes       : meeting:schedules_read"
-echo "                meeting:transcripts_read"
-echo "                meeting:admin_transcript_read"
-echo "                spark:rooms_read"
+echo "   ${SCRIPT_DIR}/webex-scribe"
 echo ""
-echo " Then run:"
-echo "   export WEBEX_CLIENT_ID=<your-client-id>"
-echo "   export WEBEX_CLIENT_SECRET=<your-client-secret>"
-echo "   ${SCRIPT_DIR}/webex-transcript-sync"
+echo " Optional: copy .env.example to .env to persist tokens or pin a"
+echo " long-lived integration token:"
+echo ""
+echo "   cp ${SCRIPT_DIR}/.env.example ${SCRIPT_DIR}/.env"
 echo ""

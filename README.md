@@ -4,7 +4,28 @@ Downloads meeting transcripts and AI summaries from Webex and creates one Google
 
 ## Getting Started
 
-### 1. Build the binary
+### Fast install (recommended)
+
+```sh
+git clone <repo>
+cd webex-scribe
+./setup.sh
+```
+
+`setup.sh` will:
+1. Install Go 1.22+ if not present (via Homebrew on macOS, tarball on Linux)
+2. Install `gcloud` if not present (Homebrew cask on macOS, apt on Debian/Ubuntu)
+3. Build the `webex-scribe` binary
+4. Open a browser to authenticate with Google Drive/Docs
+
+> **macOS:** requires [Homebrew](https://brew.sh). **Linux:** requires Debian/Ubuntu (apt).
+
+### Manual install
+
+<details>
+<summary>Click to expand manual steps</summary>
+
+**1. Build the binary** (requires Go 1.22+):
 
 ```sh
 git clone <repo>
@@ -12,27 +33,29 @@ cd webex-scribe
 go build -o webex-scribe .
 ```
 
-### 2. Set up Google authentication
+**2. Authenticate with Google:**
 
-The app needs access to Google Drive and Docs. On the first run it will open a browser to authenticate. To set up credentials:
+```sh
+gcloud auth login --enable-gdrive-access
+```
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) → **APIs & Services** → **Credentials** → **Create Credentials** → **OAuth client ID** → **Desktop app**.
-2. Enable **Google Drive API** and **Google Docs API** for your project.
-3. Copy the **Client ID** and **Client Secret** into your `.env` file:
-   ```
-   GOOGLE_CLIENT_ID="..."
-   GOOGLE_CLIENT_SECRET="..."
-   ```
+If `gcloud` isn't installed:
 
-Alternatively, if you have `gcloud` installed and authenticated with Drive access, no Google credentials file is needed — the app will fall back to `gcloud auth print-access-token` automatically.
+```sh
+sudo apt-get install google-cloud-cli   # Debian/Ubuntu
+brew install --cask google-cloud-sdk    # macOS
+# or see https://cloud.google.com/sdk/docs/install
+```
 
-### 3. Run the app
+</details>
+
+### Run the app
 
 ```sh
 ./webex-scribe
 ```
 
-On the **first run**:
+On the **first run** (after setup):
 - The app checks for a Webex personal access token. If none is found or it has expired (tokens last 12 hours), you are prompted to paste one:
   ```
   No Webex token found.
@@ -49,7 +72,7 @@ On the **first run**:
 
 On **subsequent runs** the app authenticates silently and goes straight to syncing.
 
-### 4. (Optional) Configure via `.env`
+### (Optional) Configure via `.env`
 
 Copy `.env.example` to `.env` in the project directory and fill in any values you want to persist:
 
