@@ -143,8 +143,8 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 | `-bot` | false | Use `WEBEX_BOT_TOKEN` to list bot spaces and sync transcripts into `plx-webex-meetings/` |
 | `-reauth` | false | Delete saved Webex token and re-authenticate |
 | `-google-reauth` | false | Delete saved Google token and re-authenticate |
-| `-client-id` | `$WEBEX_CLIENT_ID` | Webex OAuth2 client ID (not needed when using personal access token) |
-| `-client-secret` | `$WEBEX_CLIENT_SECRET` | Webex OAuth2 client secret |
+
+For advanced OAuth2 flags (`-client-id`, `-client-secret`) run `webex-scribe -help-advanced`.
 
 ## Authentication Details
 

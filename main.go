@@ -85,8 +85,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "warning: could not load user config: %v\n", err)
 	}
 
-	clientID := flag.String("client-id", "", "Webex OAuth2 client ID (or env WEBEX_CLIENT_ID / .env; not needed when WEBEX_TOKEN is set)")
-	clientSecret := flag.String("client-secret", "", "Webex OAuth2 client secret (or env WEBEX_CLIENT_SECRET / .env; not needed when WEBEX_TOKEN is set)")
+	clientID := flag.String("client-id", "", "Webex OAuth2 client ID (or env WEBEX_CLIENT_ID)")
+	clientSecret := flag.String("client-secret", "", "Webex OAuth2 client secret (or env WEBEX_CLIENT_SECRET)")
 	from := flag.String("from", "", "Start date YYYY-MM-DD (default: 30 days ago)")
 	to := flag.String("to", "", "End date YYYY-MM-DD (default: today)")
 	spaceID := flag.String("space-id", "", "Webex Space (room) ID to fetch transcripts from; omit for all meetings")
@@ -94,7 +94,40 @@ func main() {
 	botMode := flag.Bool("bot", false, "Use WEBEX_BOT_TOKEN to list all spaces the bot is in and download transcripts into plx-webex-meetings/")
 	reauth := flag.Bool("reauth", false, "Force re-authentication with Webex (deletes saved token)")
 	googleReauth := flag.Bool("google-reauth", false, "Force re-authentication with Google (deletes saved token)")
+
+	// Advanced flags hidden from default --help output.
+	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true}
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of webex-scribe:\n")
+		flag.VisitAll(func(f *flag.Flag) {
+			if advanced[f.Name] {
+				return
+			}
+			if f.DefValue != "" && f.DefValue != "false" {
+				fmt.Fprintf(os.Stderr, "  -%s string\n\t%s\n", f.Name, f.Usage)
+			} else {
+				fmt.Fprintf(os.Stderr, "  -%s\n\t%s\n", f.Name, f.Usage)
+			}
+		})
+		fmt.Fprintf(os.Stderr, "\nFor advanced OAuth2 options run: webex-scribe -help-advanced\n")
+	}
+	helpAdvanced := flag.Bool("help-advanced", false, "Show all flags including advanced OAuth2 options")
 	flag.Parse()
+
+	if *helpAdvanced {
+		fmt.Fprintf(os.Stderr, "Usage of webex-scribe (all flags):\n")
+		flag.VisitAll(func(f *flag.Flag) {
+			if f.Name == "help-advanced" {
+				return
+			}
+			if f.DefValue != "" && f.DefValue != "false" {
+				fmt.Fprintf(os.Stderr, "  -%s string\n\t%s\n", f.Name, f.Usage)
+			} else {
+				fmt.Fprintf(os.Stderr, "  -%s\n\t%s\n", f.Name, f.Usage)
+			}
+		})
+		os.Exit(0)
+	}
 
 	// Prefer flags, fall back to environment variables.
 	if *clientID == "" {
