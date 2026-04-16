@@ -1,4 +1,4 @@
-# webex-transcript-sync
+# webex-scribe
 
 Downloads meeting transcripts and AI summaries from Webex and creates one Google Doc per meeting, organised in Google Drive under `webex-meetings/YYYY-MM/<meeting name>/`. Each meeting folder contains a **Transcript** doc and, when available, a **Summary** doc.
 
@@ -8,8 +8,8 @@ Downloads meeting transcripts and AI summaries from Webex and creates one Google
 
 ```sh
 git clone <repo>
-cd webex-transcript-sync
-go build -o webex-transcript-sync .
+cd webex-scribe
+go build -o webex-scribe .
 ```
 
 ### 2. Set up Google authentication
@@ -29,7 +29,7 @@ Alternatively, if you have `gcloud` installed and authenticated with Drive acces
 ### 3. Run the app
 
 ```sh
-./webex-transcript-sync
+./webex-scribe
 ```
 
 On the **first run**:
@@ -82,22 +82,25 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 
 ```sh
 # Sync all transcripts from the last 30 days (default)
-./webex-transcript-sync
+./webex-scribe
 
 # Specify a date range
-./webex-transcript-sync --from 2026-03-01 --to 2026-03-31
+./webex-scribe --from 2026-03-01 --to 2026-03-31
 
 # Fetch from a specific Webex Space only
-./webex-transcript-sync --space-id Y2lzY29zcGFyazovL...
+./webex-scribe --space-id Y2lzY29zcGFyazovL...
 
 # Fetch all org transcripts (requires meeting:admin_transcript_read scope approved by org admin)
-./webex-transcript-sync --admin
+./webex-scribe --admin
+
+# Sync transcripts from all spaces a bot is a member of (uses WEBEX_BOT_TOKEN)
+./webex-scribe --bot
 
 # Force re-authentication with Webex
-./webex-transcript-sync --reauth
+./webex-scribe --reauth
 
 # Force re-authentication with Google
-./webex-transcript-sync --google-reauth
+./webex-scribe --google-reauth
 ```
 
 ## Flags
@@ -108,6 +111,7 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 | `-to` | today | End date `YYYY-MM-DD` |
 | `-space-id` | *(empty)* | Webex Space (room) ID to filter transcripts |
 | `-admin` | false | Include `meeting:admin_transcript_read` scope (org-wide transcripts) |
+| `-bot` | false | Use `WEBEX_BOT_TOKEN` to list bot spaces and sync transcripts into `plx-webex-meetings/` |
 | `-reauth` | false | Delete saved Webex token and re-authenticate |
 | `-google-reauth` | false | Delete saved Google token and re-authenticate |
 | `-client-id` | `$WEBEX_CLIENT_ID` | Webex OAuth2 client ID (not needed when using personal access token) |
@@ -118,12 +122,12 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 **Webex:** The app checks for a token in this order:
 1. `WEBEX_TOKEN` env var / `.env` file (personal access token — recommended)
 2. `~/.webex-meeting-sync/.env` (saved interactively on first run)
-3. Saved OAuth2 token at `~/.config/webex-transcript-sync/token.json`
+3. Saved OAuth2 token at `~/.config/webex-scribe/token.json`
 4. Interactive OAuth2 browser flow (if `WEBEX_CLIENT_ID` / `WEBEX_CLIENT_SECRET` are set)
 
 **Google:** Checks in this order:
 1. Application Default Credentials (`gcloud auth application-default login`)
-2. Saved in-app OAuth2 token at `~/.config/webex-transcript-sync/google_token.json`
+2. Saved in-app OAuth2 token at `~/.config/webex-scribe/google_token.json`
 3. Interactive OAuth2 browser flow (if `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` are set)
 4. `gcloud auth print-access-token`
 
