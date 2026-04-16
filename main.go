@@ -104,6 +104,16 @@ func main() {
 		*clientSecret = os.Getenv("WEBEX_CLIENT_SECRET")
 	}
 
+	// If no WEBEX_TOKEN and no OAuth2 client credentials, prompt the user
+	// for a personal access token now — before the usingOAuth check so the
+	// prompt runs instead of exiting with an error.
+	if !*botMode && *clientID == "" && os.Getenv("WEBEX_TOKEN") == "" {
+		if err := ensureWebexToken(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Client ID and secret are only required for the OAuth2 flow.
 	// When WEBEX_TOKEN is set, newWebexClient uses it directly.
 	// --bot always skips the personal sync regardless of WEBEX_TOKEN.
@@ -166,9 +176,9 @@ func main() {
 	fmt.Printf("Manifest loaded: %d previously uploaded transcript(s).\n\n", len(mf.entries))
 
 	fmt.Println("Authenticating with Webex...")
-	// When using a personal access token (not OAuth2), ensure the token is
-	// present and valid, prompting the user to paste a new one if needed.
-	if !*botMode && os.Getenv("WEBEX_CLIENT_ID") == "" || os.Getenv("WEBEX_TOKEN") != "" {
+	// Re-validate the token if we haven't already prompted (i.e. WEBEX_TOKEN
+	// was already set from the environment or .env before we started).
+	if !*botMode && *clientID == "" && os.Getenv("WEBEX_TOKEN") != "" {
 		if err := ensureWebexToken(); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)

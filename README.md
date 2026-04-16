@@ -6,13 +6,19 @@ Downloads meeting transcripts and AI summaries from Webex and creates one Google
 
 ### Fast install (recommended)
 
+Run this single command — no need to clone the repo first:
+
 ```sh
-git clone <repo>
-cd webex-scribe
+bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
+```
+
+Or if you already have the repo cloned, run `setup.sh` instead:
+
+```sh
 ./setup.sh
 ```
 
-`setup.sh` will:
+Both scripts will:
 1. Install Go 1.22+ if not present (via Homebrew on macOS, tarball on Linux)
 2. Install `gcloud` if not present (Homebrew cask on macOS, apt on Debian/Ubuntu)
 3. Build the `webex-scribe` binary
