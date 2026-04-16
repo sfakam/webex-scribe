@@ -1,0 +1,8 @@
+# Secrets — never commit these
+.env
+
+# Built binary
+webex-transcript-sync
+
+# Go test cache
+*.test
