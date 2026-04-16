@@ -1,4 +1,4 @@
-// Package main implements webex-transcript-sync, a command-line tool that
+// Package main implements webex-scribe, a command-line tool that
 // downloads Webex meeting transcripts and creates one Google Doc per meeting,
 // titled with the meeting name and date.
 package main
@@ -60,7 +60,7 @@ func loadDotEnv(path string) error {
 	return scanner.Err()
 }
 
-// main is the entry point for webex-transcript-sync.
+// main is the entry point for webex-scribe.
 //
 // It authenticates with Webex using OAuth2, fetches all meeting transcripts in
 // the requested date range, then creates one Google Doc per transcript inside

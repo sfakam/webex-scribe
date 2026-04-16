@@ -2,7 +2,7 @@
 .env
 
 # Built binary
-webex-transcript-sync
+webex-scribe
 
 # Go test cache
 *.test

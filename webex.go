@@ -1,5 +1,5 @@
 // webex.go implements Webex OAuth2 authentication and transcript retrieval
-// for webex-transcript-sync.
+// for webex-scribe.
 package main
 
 import (
@@ -159,7 +159,7 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 // webexTokenPath returns the absolute path of the persisted OAuth2 token file.
 func webexTokenPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "webex-transcript-sync", "token.json")
+	return filepath.Join(home, ".config", "webex-scribe", "token.json")
 }
 
 // loadWebexToken reads and unmarshals a previously saved oauth2.Token from

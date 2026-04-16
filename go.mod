@@ -1,4 +1,4 @@
-module webex-transcript-sync
+module webex-scribe
 
 go 1.22
 

@@ -1,5 +1,5 @@
 // gdocs.go provides Google Drive folder management and Google Docs creation
-// for webex-transcript-sync.
+// for webex-scribe.
 //
 // Google Drive is used to organise documents into a folder hierarchy:
 //
@@ -71,7 +71,7 @@ type googleClients struct {
 // googleTokenPath returns the path to the persisted Google OAuth2 token file.
 func googleTokenPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "webex-transcript-sync", "google_token.json")
+	return filepath.Join(home, ".config", "webex-scribe", "google_token.json")
 }
 
 // loadGoogleToken reads and unmarshals a previously saved Google oauth2.Token.

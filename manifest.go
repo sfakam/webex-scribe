@@ -1,5 +1,5 @@
 // manifest.go implements a Drive-backed deduplication manifest for
-// webex-transcript-sync.
+// webex-scribe.
 //
 // The manifest is stored as a JSON file named ".wts-manifest.json" inside the
 // "webex-meetings" root folder in Google Drive, so the same state is shared
