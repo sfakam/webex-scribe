@@ -68,6 +68,20 @@ case "${OS}" in
         ;;
 esac
 
+# git is required for cloning and for the one-liner invocation itself.
+if ! command -v git &>/dev/null; then
+    info "git not found. Installing..."
+    if [[ "${OS}" == "Darwin" ]]; then
+        brew install git
+    else
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq git
+    fi
+    info "git $(git --version) installed."
+else
+    info "git $(git --version) found — OK."
+fi
+
 # --------------------------------------------------------------------------- #
 # 2. Install Go (if missing or too old; minimum 1.22)
 # --------------------------------------------------------------------------- #
