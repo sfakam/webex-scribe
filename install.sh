@@ -202,9 +202,10 @@ info "Installed: $(which webex-scribe)"
 
 GCLOUD_AUTHED=false
 if gcloud auth list --filter="status=ACTIVE" --format="value(account)" 2>/dev/null | grep -q '@'; then
-    if gcloud auth print-access-token 2>/dev/null | xargs -I{} curl -sf \
-        -H "Authorization: Bearer {}" \
-        "https://www.googleapis.com/drive/v3/about?fields=user" > /dev/null 2>&1; then
+    # Check that a Drive-scoped token can actually be minted — this confirms
+    # the account was authenticated with --enable-gdrive-access.
+    if gcloud auth print-access-token \
+        --scopes=https://www.googleapis.com/auth/drive 2>/dev/null | grep -q '.'; then
         GCLOUD_AUTHED=true
     fi
 fi
