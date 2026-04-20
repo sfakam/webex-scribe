@@ -5,11 +5,19 @@
 #
 #   bash <(curl -fsSL "https://raw.githubusercontent.com/sfakam/webex-scribe/main/install.sh")
 #
+# Or run from inside a local clone to build from the current source:
+#
+#   ./install.sh --local
+#
 # What it does:
-#   1. Tries to download a pre-built binary from the latest GitHub Release
-#   2. Falls back to cloning the repo and building from source (requires Go 1.22+)
-#   3. Installs gcloud if missing
-#   4. Authenticates with Google Drive/Docs (skipped if already authed)
+#   1. (default) Tries to download a pre-built binary from the latest GitHub Release
+#      Falls back to cloning the repo and building from source (requires Go 1.22+)
+#   1. (--local) Builds from the current directory (must be inside the repo)
+#   2. Installs gcloud if missing
+#   3. Authenticates with Google Drive/Docs (skipped if already authed)
+#
+# Flags:
+#   --local   Build from the current repo directory instead of downloading
 #
 # Environment variables (all optional):
 #   WEBEX_SCRIBE_SRC_DIR   Where to clone the source for fallback build (default: /tmp/webex-scribe-src)
@@ -24,6 +32,15 @@ REPO_HTTPS="https://github.com/sfakam/webex-scribe.git"
 GITHUB_RELEASES="https://github.com/sfakam/webex-scribe/releases/latest/download"
 SRC_DIR="${WEBEX_SCRIBE_SRC_DIR:-/tmp/webex-scribe-src}"
 INSTALL_DIR="${WEBEX_SCRIBE_INSTALL:-/usr/local/bin}"
+
+# Parse flags
+LOCAL_BUILD=false
+for arg in "$@"; do
+    case "${arg}" in
+        --local) LOCAL_BUILD=true ;;
+        *) die "Unknown argument: ${arg}" ;;
+    esac
+done
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -45,6 +62,11 @@ echo "============================================================"
 echo " webex-scribe installer"
 echo "============================================================"
 echo ""
+if [[ "${LOCAL_BUILD}" == "true" ]]; then
+    echo " Mode              : local build from $(pwd)"
+else
+    echo " Mode              : download pre-built binary (fallback: build from source)"
+fi
 echo " Binary will be installed  : ${INSTALL_DIR}/webex-scribe"
 echo ""
 read -rp "Continue? [yes/no]: " REPLY
@@ -98,40 +120,18 @@ case "${OS}" in
 esac
 
 # --------------------------------------------------------------------------- #
-# 3. Download pre-built binary (primary) or build from source (fallback)
+# 3. Build / download binary
 # --------------------------------------------------------------------------- #
 
 BUILT_FROM_SOURCE=false
 
-if [[ -n "${BINARY_SUFFIX}" ]]; then
-    RELEASE_URL="${GITHUB_RELEASES}/webex-scribe-${BINARY_SUFFIX}"
-    DOWNLOAD_TMP="$(mktemp /tmp/webex-scribe-download.XXXXXX)"
-    info "Downloading pre-built binary: ${RELEASE_URL}"
-    CURL_EXIT=0
-    HTTP_CODE=$(curl -fsSL \
-        --write-out "%{http_code} url=%{url_effective} size=%{size_download} time=%{time_total}s" \
-        --output "${DOWNLOAD_TMP}" \
-        "${RELEASE_URL}" 2>&1) || CURL_EXIT=$?
-    info "Download result: exit=${CURL_EXIT} ${HTTP_CODE}"
-    if [[ "${CURL_EXIT}" -eq 0 && -s "${DOWNLOAD_TMP}" ]]; then
-        mv "${DOWNLOAD_TMP}" /tmp/webex-scribe
-        chmod +x /tmp/webex-scribe
-        info "Downloaded: $(/tmp/webex-scribe --version)"
-    else
-        rm -f "${DOWNLOAD_TMP}"
-        warn "GitHub release download failed (exit=${CURL_EXIT}) — falling back to building from source."
-        BUILT_FROM_SOURCE=true
+if [[ "${LOCAL_BUILD}" == "true" ]]; then
+    # ---- Local build from current directory --------------------------------
+    if [[ ! -f go.mod ]]; then
+        die "--local requires running from inside the webex-scribe repo (no go.mod found in $(pwd))"
     fi
-else
-    warn "No pre-built binary available for ${OS}/${ARCH} — building from source."
-    BUILT_FROM_SOURCE=true
-fi
 
-if [[ "${BUILT_FROM_SOURCE}" == "true" ]]; then
-
-    # Install Go if missing or too old (minimum 1.22)
     MIN_GO_MINOR=22
-
     install_go_linux() {
         local GO_VERSION="1.23.6"
         local GO_ARCH="amd64"
@@ -146,14 +146,12 @@ if [[ "${BUILT_FROM_SOURCE}" == "true" ]]; then
         export PATH="/usr/local/go/bin:${PATH}"
         info "Go $(go version) installed."
     }
-
     install_go_mac() {
         info "Installing Go via Homebrew..."
         brew install go
         export PATH="$(brew --prefix go)/bin:${PATH}"
         info "Go $(go version) installed."
     }
-
     if command -v go &>/dev/null; then
         CURRENT_MINOR=$(go version | sed -E 's/.*go1\.([0-9]+).*/\1/')
         if (( CURRENT_MINOR < MIN_GO_MINOR )); then
@@ -168,28 +166,97 @@ if [[ "${BUILT_FROM_SOURCE}" == "true" ]]; then
     fi
     export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
 
-    # Clone / update source
-    if [[ -d "${SRC_DIR}/.git" ]]; then
-        info "Source exists at ${SRC_DIR} — pulling latest..."
-        git -C "${SRC_DIR}" pull --ff-only
-    else
-        info "Cloning webex-scribe into ${SRC_DIR}..."
-        if git clone "${REPO_SSH}" "${SRC_DIR}" 2>/dev/null; then
-            info "Cloned via SSH."
-        else
-            warn "SSH clone failed — falling back to HTTPS..."
-            git clone "${REPO_HTTPS}" "${SRC_DIR}"
-            info "Cloned via HTTPS."
-        fi
-    fi
-
-    # Build
-    info "Building webex-scribe..."
-    cd "${SRC_DIR}"
+    info "Building webex-scribe from $(pwd)..."
     VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
     go build -ldflags "-X main.version=${VERSION}" -o /tmp/webex-scribe .
+    chmod +x /tmp/webex-scribe
     info "Binary built (version: ${VERSION})."
-fi
+
+else
+    # ---- Download pre-built binary (primary) or build from source (fallback)
+    if [[ -n "${BINARY_SUFFIX}" ]]; then
+        RELEASE_URL="${GITHUB_RELEASES}/webex-scribe-${BINARY_SUFFIX}"
+        DOWNLOAD_TMP="$(mktemp /tmp/webex-scribe-download.XXXXXX)"
+        info "Downloading pre-built binary: ${RELEASE_URL}"
+        CURL_EXIT=0
+        HTTP_CODE=$(curl -fsSL \
+            --write-out "%{http_code} url=%{url_effective} size=%{size_download} time=%{time_total}s" \
+            --output "${DOWNLOAD_TMP}" \
+            "${RELEASE_URL}" 2>&1) || CURL_EXIT=$?
+        info "Download result: exit=${CURL_EXIT} ${HTTP_CODE}"
+        if [[ "${CURL_EXIT}" -eq 0 && -s "${DOWNLOAD_TMP}" ]]; then
+            mv "${DOWNLOAD_TMP}" /tmp/webex-scribe
+            chmod +x /tmp/webex-scribe
+            info "Downloaded: $(/tmp/webex-scribe --version)"
+        else
+            rm -f "${DOWNLOAD_TMP}"
+            warn "GitHub release download failed (exit=${CURL_EXIT}) — falling back to building from source."
+            BUILT_FROM_SOURCE=true
+        fi
+    else
+        warn "No pre-built binary available for ${OS}/${ARCH} — building from source."
+        BUILT_FROM_SOURCE=true
+    fi
+
+    if [[ "${BUILT_FROM_SOURCE}" == "true" ]]; then
+        MIN_GO_MINOR=22
+        install_go_linux() {
+            local GO_VERSION="1.23.6"
+            local GO_ARCH="amd64"
+            [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]] && GO_ARCH="arm64"
+            local GO_TARBALL="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+            info "Downloading Go ${GO_VERSION} (linux/${GO_ARCH})..."
+            curl -fsSL "https://go.dev/dl/${GO_TARBALL}" -o "/tmp/${GO_TARBALL}"
+            info "Installing Go ${GO_VERSION} to /usr/local/go ..."
+            sudo rm -rf /usr/local/go
+            sudo tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
+            rm "/tmp/${GO_TARBALL}"
+            export PATH="/usr/local/go/bin:${PATH}"
+            info "Go $(go version) installed."
+        }
+        install_go_mac() {
+            info "Installing Go via Homebrew..."
+            brew install go
+            export PATH="$(brew --prefix go)/bin:${PATH}"
+            info "Go $(go version) installed."
+        }
+        if command -v go &>/dev/null; then
+            CURRENT_MINOR=$(go version | sed -E 's/.*go1\.([0-9]+).*/\1/')
+            if (( CURRENT_MINOR < MIN_GO_MINOR )); then
+                warn "Go 1.${CURRENT_MINOR} is too old (need >= 1.${MIN_GO_MINOR}). Upgrading..."
+                [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
+            else
+                info "Go $(go version) found — OK."
+            fi
+        else
+            info "Go not found. Installing..."
+            [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
+        fi
+        export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
+
+        # Clone / update source
+        if [[ -d "${SRC_DIR}/.git" ]]; then
+            info "Source exists at ${SRC_DIR} — pulling latest..."
+            git -C "${SRC_DIR}" pull --ff-only
+        else
+            info "Cloning webex-scribe into ${SRC_DIR}..."
+            if git clone "${REPO_SSH}" "${SRC_DIR}" 2>/dev/null; then
+                info "Cloned via SSH."
+            else
+                warn "SSH clone failed — falling back to HTTPS..."
+                git clone "${REPO_HTTPS}" "${SRC_DIR}"
+                info "Cloned via HTTPS."
+            fi
+        fi
+
+        info "Building webex-scribe..."
+        cd "${SRC_DIR}"
+        VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+        go build -ldflags "-X main.version=${VERSION}" -o /tmp/webex-scribe .
+        info "Binary built (version: ${VERSION})."
+    fi
+
+fi # end LOCAL_BUILD / download+build
 
 # --------------------------------------------------------------------------- #
 # 4. Install binary to INSTALL_DIR
