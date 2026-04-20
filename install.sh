@@ -3,10 +3,10 @@
 #
 # Designed to be run directly without cloning the repo first:
 #
-#   bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
+#   bash <(curl -fsSLk --cert ~/.certs/${USER}.crt --key ~/.certs/${USER}.key \
+#     "https://git.source.akamai.com/rest/api/1.0/users/sfathall/repos/webex-scribe/raw/install.sh?at=refs/heads/main")
 #
-# Requires SSH key access to git.source.akamai.com.
-# HTTPS is not supported (server requires mTLS client certificates).
+# Requires Akamai mTLS client certs at ~/.certs/<username>.{crt,key}.
 #
 # What it does:
 #   1. Installs Go 1.22+ (Homebrew on macOS, tarball on Linux)
