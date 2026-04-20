@@ -591,6 +591,17 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 			titleTrunc = titleTrunc[:37] + "..."
 		}
 		fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n", action, titleTrunc, dateStr, meetingType, folderPath)
+
+		roomIDStr := item.RoomID
+		if roomIDStr == "" {
+			roomIDStr = "(none)"
+		}
+		seriesIDStr := item.MeetingSeriesID
+		if seriesIDStr == "" {
+			seriesIDStr = "(none)"
+		}
+		fmt.Printf("         meetingId=%-36s  roomId=%-36s  seriesId=%s\n",
+			item.MeetingID, roomIDStr, seriesIDStr)
 	}
 
 	fmt.Printf("\nTotal: %d to upload, %d already uploaded (would skip).\n", toUpload, toSkip)

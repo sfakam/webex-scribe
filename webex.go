@@ -679,11 +679,12 @@ func (c *WebexClient) fetchRoomMembers(roomID string) ([]RoomMember, error) {
 // transcriptItem is the JSON shape returned by the Webex
 // GET /meetingTranscripts list endpoint.
 type transcriptItem struct {
-	ID           string `json:"id"`
-	MeetingID    string `json:"meetingId"`
-	MeetingTopic string `json:"meetingTopic"`
-	RoomID       string `json:"roomId"`
-	StartTime    string `json:"startTime"`
+	ID              string `json:"id"`
+	MeetingID       string `json:"meetingId"`
+	MeetingSeriesID string `json:"meetingSeriesId"`
+	MeetingTopic    string `json:"meetingTopic"`
+	RoomID          string `json:"roomId"`
+	StartTime       string `json:"startTime"`
 }
 
 // listTranscriptPage fetches a single page of transcript metadata from apiURL
