@@ -206,8 +206,23 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Ensuring Drive folder structure (%s/YYYY-MM)...\n", rootFolderName)
+	fmt.Printf("Ensuring Drive folder structure (%s/{personal-room,direct-rooms,shared-rooms}/<space>)...\n", rootFolderName)
 	rootFolderID, err := ensureFolder(ctx, clients.drive, rootFolderName, "root")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	personalFolderID, err := ensureFolder(ctx, clients.drive, "personal-room", rootFolderID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	directFolderID, err := ensureFolder(ctx, clients.drive, "direct-rooms", rootFolderID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	sharedFolderID, err := ensureFolder(ctx, clients.drive, "shared-rooms", rootFolderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -279,7 +294,9 @@ func main() {
 
 	if len(toDownload) == 0 {
 		fmt.Printf("\nAll %d transcript(s) already uploaded. Nothing to do.\n", skipped)
-		fmt.Printf("\n  webex-meetings folder: %s\n", makeFolderURL(rootFolderID))
+		fmt.Printf("\n  personal-room:  %s\n", makeFolderURL(personalFolderID))
+		fmt.Printf("  direct-rooms:   %s\n", makeFolderURL(directFolderID))
+		fmt.Printf("  shared-rooms:   %s\n", makeFolderURL(sharedFolderID))
 		return
 	}
 
@@ -314,7 +331,20 @@ func main() {
 			defer wg.Done()
 			for t := range work {
 				t0 := time.Now()
-				tURL, sURL, err := createMeetingDocs(ctx, clients, rootFolderID, t)
+				// Route based on space type:
+				//   no roomId / no space name → personal-room  (PMR or unlinked scheduled meeting)
+				//   SpaceType == "direct"      → direct-rooms   (1:1 space)
+				//   SpaceType == "group"        → shared-rooms   (team space)
+				var targetFolderID string
+				switch {
+				case t.RoomID == "" || t.SpaceName == "":
+					targetFolderID = personalFolderID
+				case t.SpaceType == "direct":
+					targetFolderID = directFolderID
+				default: // "group" or any future type
+					targetFolderID = sharedFolderID
+				}
+				tURL, sURL, err := createMeetingDocs(ctx, clients, targetFolderID, t)
 				results <- uploadResult{t: t, transcriptURL: tURL, summaryURL: sURL, duration: time.Since(t0), err: err}
 			}
 		}()
@@ -382,7 +412,9 @@ func main() {
 
 	fmt.Printf("\nDone! Uploaded: %d  Skipped (already uploaded): %d  Total time: %s\n",
 		uploaded, skipped, time.Since(uploadStart).Round(time.Second))
-	fmt.Printf("\n  webex-meetings folder: %s\n", makeFolderURL(rootFolderID))
+	fmt.Printf("\n  personal-room:  %s\n", makeFolderURL(personalFolderID))
+	fmt.Printf("  direct-rooms:   %s\n", makeFolderURL(directFolderID))
+	fmt.Printf("  shared-rooms:   %s\n", makeFolderURL(sharedFolderID))
 
 	// Bot mode: after the personal sync, also run the bot space sweep if
 	// --bot was requested.
