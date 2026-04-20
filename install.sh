@@ -5,18 +5,15 @@
 #
 #   bash <(curl -fsSL "https://raw.githubusercontent.com/sfakam/webex-scribe/main/install.sh")
 #
-# Requires a GitHub account with access to the repo.
-#
 # What it does:
-#   1. Installs Go 1.22+ (Homebrew on macOS, tarball on Linux)
-#   2. Installs gcloud (Homebrew cask on macOS, apt on Debian/Ubuntu)
-#   3. Clones/updates the webex-scribe repo to WEBEX_SCRIBE_SRC_DIR
-#   4. Builds the binary and installs it to /usr/local/bin/webex-scribe
-#   5. Authenticates with Google Drive/Docs (skipped if already authed)
+#   1. Tries to download a pre-built binary from the latest GitHub Release
+#   2. Falls back to cloning the repo and building from source (requires Go 1.22+)
+#   3. Installs gcloud if missing
+#   4. Authenticates with Google Drive/Docs (skipped if already authed)
 #
 # Environment variables (all optional):
-#   WEBEX_SCRIBE_SRC_DIR   Where to clone the source (default: ~/webex-scribe-src)
-#   WEBEX_SCRIBE_INSTALL   Binary install location   (default: /usr/local/bin)
+#   WEBEX_SCRIBE_SRC_DIR   Where to clone the source for fallback build (default: /tmp/webex-scribe-src)
+#   WEBEX_SCRIBE_INSTALL   Binary install location                       (default: /usr/local/bin)
 #
 # Tested on Ubuntu 20.04, 22.04, 24.04 and macOS (Homebrew).
 
@@ -24,6 +21,7 @@ set -euo pipefail
 
 REPO_SSH="git@github.com:sfakam/webex-scribe.git"
 REPO_HTTPS="https://github.com/sfakam/webex-scribe.git"
+GITHUB_RELEASES="https://github.com/sfakam/webex-scribe/releases/latest/download"
 SRC_DIR="${WEBEX_SCRIBE_SRC_DIR:-/tmp/webex-scribe-src}"
 INSTALL_DIR="${WEBEX_SCRIBE_INSTALL:-/usr/local/bin}"
 
@@ -36,6 +34,7 @@ warn()  { echo "WARN: $*" >&2; }
 die()   { echo "ERROR: $*" >&2; exit 1; }
 
 OS="$(uname -s)"
+ARCH="$(uname -m)"
 
 # --------------------------------------------------------------------------- #
 # 1. Check OS / prerequisites
@@ -46,7 +45,6 @@ echo "============================================================"
 echo " webex-scribe installer"
 echo "============================================================"
 echo ""
-echo " Source will be cloned to : ${SRC_DIR} (in /tmp; deleted on reboot)"
 echo " Binary will be installed  : ${INSTALL_DIR}/webex-scribe"
 echo ""
 read -rp "Continue? [yes/no]: " REPLY
@@ -71,7 +69,7 @@ case "${OS}" in
         ;;
 esac
 
-# git is required for cloning and for the one-liner invocation itself.
+# git is required for the source-build fallback.
 if ! command -v git &>/dev/null; then
     info "git not found. Installing..."
     if [[ "${OS}" == "Darwin" ]]; then
@@ -86,54 +84,114 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 2. Install Go (if missing or too old; minimum 1.22)
+# 2. Resolve platform binary suffix
 # --------------------------------------------------------------------------- #
 
-MIN_GO_MINOR=22
+BINARY_SUFFIX=""
+case "${OS}" in
+    Darwin)
+        [[ "${ARCH}" == "arm64" ]] && BINARY_SUFFIX="macos-arm64" || BINARY_SUFFIX="macos-amd64"
+        ;;
+    Linux)
+        [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]] && BINARY_SUFFIX="linux-arm64" || BINARY_SUFFIX="linux-amd64"
+        ;;
+esac
 
-install_go_linux() {
-    local GO_VERSION="1.23.6"
-    local ARCH
-    ARCH="$(uname -m)"
-    local GO_ARCH="amd64"
-    [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]] && GO_ARCH="arm64"
-    local GO_TARBALL="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
-    local GO_URL="https://go.dev/dl/${GO_TARBALL}"
+# --------------------------------------------------------------------------- #
+# 3. Download pre-built binary (primary) or build from source (fallback)
+# --------------------------------------------------------------------------- #
 
-    info "Downloading Go ${GO_VERSION} (linux/${GO_ARCH})..."
-    curl -fsSL "${GO_URL}" -o "/tmp/${GO_TARBALL}"
-    info "Installing Go ${GO_VERSION} to /usr/local/go ..."
-    sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
-    rm "/tmp/${GO_TARBALL}"
-    export PATH="/usr/local/go/bin:${PATH}"
-    info "Go $(go version) installed."
-}
+BUILT_FROM_SOURCE=false
 
-install_go_mac() {
-    info "Installing Go via Homebrew..."
-    brew install go
-    export PATH="$(brew --prefix go)/bin:${PATH}"
-    info "Go $(go version) installed."
-}
-
-if command -v go &>/dev/null; then
-    CURRENT_MINOR=$(go version | sed -E 's/.*go1\.([0-9]+).*/\1/')
-    if (( CURRENT_MINOR < MIN_GO_MINOR )); then
-        warn "Go 1.${CURRENT_MINOR} is too old (need >= 1.${MIN_GO_MINOR}). Upgrading..."
-        [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
+if [[ -n "${BINARY_SUFFIX}" ]]; then
+    RELEASE_URL="${GITHUB_RELEASES}/webex-scribe-${BINARY_SUFFIX}"
+    info "Downloading pre-built binary for ${BINARY_SUFFIX}..."
+    if curl -fsSL --output "/tmp/webex-scribe" "${RELEASE_URL}" 2>/dev/null; then
+        chmod +x /tmp/webex-scribe
+        info "Downloaded: $(/tmp/webex-scribe --version)"
     else
-        info "Go $(go version) found — OK."
+        warn "GitHub release download failed — falling back to building from source."
+        BUILT_FROM_SOURCE=true
     fi
 else
-    info "Go not found. Installing..."
-    [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
+    warn "No pre-built binary available for ${OS}/${ARCH} — building from source."
+    BUILT_FROM_SOURCE=true
 fi
 
-export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
+if [[ "${BUILT_FROM_SOURCE}" == "true" ]]; then
+
+    # Install Go if missing or too old (minimum 1.22)
+    MIN_GO_MINOR=22
+
+    install_go_linux() {
+        local GO_VERSION="1.23.6"
+        local GO_ARCH="amd64"
+        [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]] && GO_ARCH="arm64"
+        local GO_TARBALL="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+        info "Downloading Go ${GO_VERSION} (linux/${GO_ARCH})..."
+        curl -fsSL "https://go.dev/dl/${GO_TARBALL}" -o "/tmp/${GO_TARBALL}"
+        info "Installing Go ${GO_VERSION} to /usr/local/go ..."
+        sudo rm -rf /usr/local/go
+        sudo tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
+        rm "/tmp/${GO_TARBALL}"
+        export PATH="/usr/local/go/bin:${PATH}"
+        info "Go $(go version) installed."
+    }
+
+    install_go_mac() {
+        info "Installing Go via Homebrew..."
+        brew install go
+        export PATH="$(brew --prefix go)/bin:${PATH}"
+        info "Go $(go version) installed."
+    }
+
+    if command -v go &>/dev/null; then
+        CURRENT_MINOR=$(go version | sed -E 's/.*go1\.([0-9]+).*/\1/')
+        if (( CURRENT_MINOR < MIN_GO_MINOR )); then
+            warn "Go 1.${CURRENT_MINOR} is too old (need >= 1.${MIN_GO_MINOR}). Upgrading..."
+            [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
+        else
+            info "Go $(go version) found — OK."
+        fi
+    else
+        info "Go not found. Installing..."
+        [[ "${OS}" == "Darwin" ]] && install_go_mac || install_go_linux
+    fi
+    export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
+
+    # Clone / update source
+    if [[ -d "${SRC_DIR}/.git" ]]; then
+        info "Source exists at ${SRC_DIR} — pulling latest..."
+        git -C "${SRC_DIR}" pull --ff-only
+    else
+        info "Cloning webex-scribe into ${SRC_DIR}..."
+        if git clone "${REPO_SSH}" "${SRC_DIR}" 2>/dev/null; then
+            info "Cloned via SSH."
+        else
+            warn "SSH clone failed — falling back to HTTPS..."
+            git clone "${REPO_HTTPS}" "${SRC_DIR}"
+            info "Cloned via HTTPS."
+        fi
+    fi
+
+    # Build
+    info "Building webex-scribe..."
+    cd "${SRC_DIR}"
+    VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+    go build -ldflags "-X main.version=${VERSION}" -o /tmp/webex-scribe .
+    info "Binary built (version: ${VERSION})."
+fi
 
 # --------------------------------------------------------------------------- #
-# 3. Install gcloud (if missing)
+# 4. Install binary to INSTALL_DIR
+# --------------------------------------------------------------------------- #
+
+info "Installing webex-scribe to ${INSTALL_DIR}/webex-scribe ..."
+sudo install -m 755 /tmp/webex-scribe "${INSTALL_DIR}/webex-scribe"
+info "Installed: $(which webex-scribe) — $(webex-scribe --version)"
+
+# --------------------------------------------------------------------------- #
+# 5. Install gcloud (if missing)
 # --------------------------------------------------------------------------- #
 
 if command -v gcloud &>/dev/null; then
@@ -142,8 +200,7 @@ else
     info "Installing Google Cloud SDK..."
     if [[ "${OS}" == "Darwin" ]]; then
         brew install --cask google-cloud-sdk
-        GCLOUD_BREW_PATH="$(brew --prefix)/share/google-cloud-sdk/bin"
-        export PATH="${GCLOUD_BREW_PATH}:${PATH}"
+        export PATH="$(brew --prefix)/share/google-cloud-sdk/bin:${PATH}"
     else
         sudo apt-get update -qq
         sudo apt-get install -y -qq apt-transport-https ca-certificates gnupg curl
@@ -162,43 +219,7 @@ https://packages.cloud.google.com/apt cloud-sdk main" \
 fi
 
 # --------------------------------------------------------------------------- #
-# 4. Clone / update the source
-# --------------------------------------------------------------------------- #
-
-if [[ -d "${SRC_DIR}/.git" ]]; then
-    info "Source already exists at ${SRC_DIR} — pulling latest..."
-    git -C "${SRC_DIR}" pull --ff-only
-else
-    info "Cloning webex-scribe into ${SRC_DIR}..."
-    if git clone "${REPO_SSH}" "${SRC_DIR}" 2>/dev/null; then
-        info "Cloned via SSH."
-    else
-        warn "SSH clone failed (no SSH key?). Falling back to HTTPS..."
-        git clone "${REPO_HTTPS}" "${SRC_DIR}"
-        info "Cloned via HTTPS."
-    fi
-fi
-
-# --------------------------------------------------------------------------- #
-# 5. Build the binary
-# --------------------------------------------------------------------------- #
-
-info "Building webex-scribe..."
-cd "${SRC_DIR}"
-VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
-go build -ldflags "-X main.version=${VERSION}" -o webex-scribe .
-info "Binary built (version: ${VERSION})."
-
-# --------------------------------------------------------------------------- #
-# 6. Install binary to INSTALL_DIR
-# --------------------------------------------------------------------------- #
-
-info "Installing webex-scribe to ${INSTALL_DIR}/webex-scribe ..."
-sudo install -m 755 "${SRC_DIR}/webex-scribe" "${INSTALL_DIR}/webex-scribe"
-info "Installed: $(which webex-scribe)"
-
-# --------------------------------------------------------------------------- #
-# 7. Google authentication
+# 6. Google authentication
 # --------------------------------------------------------------------------- #
 
 GCLOUD_AUTHED=false
