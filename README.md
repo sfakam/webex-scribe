@@ -94,14 +94,14 @@ Project `.env` values take precedence over `~/.webex-meeting-sync/.env`. Useful 
 
 ```
 webex-meetings/
-  Chris:Sherif 1:1/
-    Chris:Sherif 1:1 — Apr 15, 2026 — Transcript
-    Chris:Sherif 1:1 — Apr 15, 2026 — Summary
-    Chris:Sherif 1:1 — Apr 1, 2026 — Transcript
-    Chris:Sherif 1:1 — Apr 1, 2026 — Summary
-  Demo Review — InfraSec Agentic Workflows/
-    Demo Review — InfraSec Agentic Workflows — Apr 9, 2026 — Transcript
-    Demo Review — InfraSec Agentic Workflows — Apr 9, 2026 — Summary
+  Team Weekly Sync/
+    Team Weekly Sync — Apr 15, 2026 — Transcript
+    Team Weekly Sync — Apr 15, 2026 — Summary
+    Team Weekly Sync — Apr 1, 2026 — Transcript
+    Team Weekly Sync — Apr 1, 2026 — Summary
+  1:1 with Manager/
+    1:1 with Manager — Apr 9, 2026 — Transcript
+    1:1 with Manager — Apr 9, 2026 — Summary
   ...
 ```
 
@@ -146,7 +146,7 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 | `-to` | today | End date `YYYY-MM-DD` |
 | `-space-id` | *(empty)* | Webex Space (room) ID to filter transcripts |
 | `-admin` | false | Include `meeting:admin_transcript_read` scope (org-wide transcripts) |
-| `-bot` | false | Use `WEBEX_BOT_TOKEN` to list bot spaces and sync transcripts into `plx-webex-meetings/` |
+| `-bot` | false | Use `WEBEX_BOT_TOKEN` to list bot spaces and sync transcripts into `webex-meetings-bot/` |
 | `-reauth` | false | Delete saved Webex token and re-authenticate |
 | `-google-reauth` | false | Delete saved Google token and re-authenticate |
 

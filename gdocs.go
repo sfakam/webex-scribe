@@ -39,7 +39,7 @@ const (
 
 	// botRootFolderName is the top-level Drive folder used when running in
 	// bot mode (--bot), keeping bot-sourced transcripts separate.
-	botRootFolderName = "plx-webex-meetings"
+	botRootFolderName = "webex-meetings-bot"
 
 	// driveFolderMIME is the MIME type that identifies a Google Drive folder.
 	driveFolderMIME = "application/vnd.google-apps.folder"
