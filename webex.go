@@ -47,14 +47,20 @@ type RoomMember struct {
 	IsModerator bool
 }
 
+// RoomInfo holds the title and type of a Webex Space.
+// Type values from the API: "direct" (1:1), "group" (shared team space).
+type RoomInfo struct {
+	Title string
+	Type  string // "direct" or "group"
+}
+
 // WebexClient wraps an authenticated HTTP client for the Webex REST API.
 type WebexClient struct {
 	httpClient *http.Client
 
-	// roomNameCache caches roomId -> room title to avoid redundant API calls
-	// when many transcripts share the same space.
-	roomNameMu    sync.Mutex
-	roomNameCache map[string]string
+	// roomInfoCache caches roomId -> RoomInfo (title + type).
+	roomInfoMu    sync.Mutex
+	roomInfoCache map[string]RoomInfo
 
 	// roomMembersCache caches roomId -> member list.
 	roomMembersMu    sync.Mutex
@@ -70,6 +76,9 @@ type Transcript struct {
 	// SpaceName is the human-readable Webex Space (room) title resolved from
 	// RoomID. It is empty for scheduled meetings that are not tied to a Space.
 	SpaceName string
+	// SpaceType is the Webex room type: "direct" (1:1) or "group" (shared).
+	// Empty when the transcript is not linked to a Space.
+	SpaceType string
 	// RoomID is the Webex Space roomId, used to fetch members.
 	RoomID    string
 	StartTime time.Time
@@ -390,11 +399,14 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
 		}
 		// Resolve the Space name and member list when a roomId is present.
-		var spaceName string
+		var spaceName, spaceType string
 		var members []RoomMember
 		if item.RoomID != "" {
-			if name, err := client.fetchRoomName(item.RoomID); err == nil {
-				spaceName = name
+			if info, err := client.fetchRoomInfo(item.RoomID); err == nil {
+				spaceName = info.Title
+				spaceType = info.Type
+			} else {
+				fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", item.RoomID, err)
 			}
 			if m, err := client.fetchRoomMembers(item.RoomID); err == nil {
 				members = m
@@ -407,6 +419,7 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			MeetingID:    item.MeetingID,
 			MeetingTitle: item.MeetingTopic,
 			SpaceName:    spaceName,
+			SpaceType:    spaceType,
 			RoomID:       item.RoomID,
 			StartTime:    startTime,
 			Content:      content,
@@ -417,40 +430,49 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 	return transcripts
 }
 
-// fetchRoomName resolves a Webex roomId to its human-readable title.
-// Results are cached so repeated calls for the same room cost only one API
-// round-trip. Returns an error when the room cannot be found or the API fails.
-func (c *WebexClient) fetchRoomName(roomID string) (string, error) {
-	c.roomNameMu.Lock()
-	if c.roomNameCache == nil {
-		c.roomNameCache = make(map[string]string)
+// fetchRoomInfo resolves a Webex roomId to its title and type ("direct" or
+// "group"). Results are cached. Returns an error when the room cannot be found
+// or the API fails.
+func (c *WebexClient) fetchRoomInfo(roomID string) (RoomInfo, error) {
+	c.roomInfoMu.Lock()
+	if c.roomInfoCache == nil {
+		c.roomInfoCache = make(map[string]RoomInfo)
 	}
-	if name, ok := c.roomNameCache[roomID]; ok {
-		c.roomNameMu.Unlock()
-		return name, nil
+	if info, ok := c.roomInfoCache[roomID]; ok {
+		c.roomInfoMu.Unlock()
+		return info, nil
 	}
-	c.roomNameMu.Unlock()
+	c.roomInfoMu.Unlock()
 
 	apiURL := webexAPIBase + "/rooms/" + url.PathEscape(roomID)
 	resp, err := c.httpClient.Get(apiURL)
 	if err != nil {
-		return "", fmt.Errorf("fetching room %s: %w", roomID, err)
+		return RoomInfo{}, fmt.Errorf("fetching room %s: %w", roomID, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("rooms API returned %d for %s", resp.StatusCode, roomID)
+		return RoomInfo{}, fmt.Errorf("rooms API returned %d for %s", resp.StatusCode, roomID)
 	}
 	var room struct {
 		Title string `json:"title"`
+		Type  string `json:"type"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&room); err != nil {
-		return "", fmt.Errorf("decoding room %s: %w", roomID, err)
+		return RoomInfo{}, fmt.Errorf("decoding room %s: %w", roomID, err)
 	}
+	info := RoomInfo{Title: room.Title, Type: room.Type}
 
-	c.roomNameMu.Lock()
-	c.roomNameCache[roomID] = room.Title
-	c.roomNameMu.Unlock()
-	return room.Title, nil
+	c.roomInfoMu.Lock()
+	c.roomInfoCache[roomID] = info
+	c.roomInfoMu.Unlock()
+	return info, nil
+}
+
+// fetchRoomName is a convenience wrapper around fetchRoomInfo that returns
+// only the room title. Kept for callers that don't need the type.
+func (c *WebexClient) fetchRoomName(roomID string) (string, error) {
+	info, err := c.fetchRoomInfo(roomID)
+	return info.Title, err
 }
 
 // fetchRoomMembers returns the members of the Webex Space identified by
