@@ -497,10 +497,15 @@ func insertTextReq(index int64, text string) *docsapi.Request {
 
 // retryOnRateLimit calls fn and retries up to maxRetries times when the Docs
 // or Drive API responds with a rate-limit error (HTTP 429 or 403
-// rateLimitExceeded). Each retry waits 2^attempt seconds (capped at 64 s) to
-// let the per-minute quota window reset.
+// rateLimitExceeded). The first retry waits 15 s; each subsequent wait doubles
+// (15 → 30 → 60 → 120 → 240 s) to give the per-minute quota window time to
+// reset without hammering the API.
 func retryOnRateLimit(fn func() error) error {
-	const maxRetries = 6
+	const (
+		maxRetries   = 6
+		initialWait  = 15 * time.Second
+		maxWait      = 240 * time.Second
+	)
 	for attempt := range maxRetries {
 		err := fn()
 		if err == nil {
@@ -510,14 +515,13 @@ func retryOnRateLimit(fn func() error) error {
 		if !errors.As(err, &gErr) {
 			return err
 		}
-		fmt.Printf("        warning: rate limit hit, wait...\n")
 		if gErr.Code != http.StatusTooManyRequests &&
 			!(gErr.Code == http.StatusForbidden && strings.Contains(gErr.Message, "rateLimitExceeded")) {
 			return err
 		}
-		wait := time.Duration(math.Pow(2, float64(attempt+1))) * time.Second
-		if wait > 64*time.Second {
-			wait = 64 * time.Second
+		wait := time.Duration(float64(initialWait) * math.Pow(2, float64(attempt)))
+		if wait > maxWait {
+			wait = maxWait
 		}
 		fmt.Printf("        rate limit hit, retrying in %s (attempt %d/%d)...\n", wait, attempt+1, maxRetries)
 		time.Sleep(wait)
