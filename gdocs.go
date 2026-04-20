@@ -402,7 +402,51 @@ func createMeetingDocs(ctx context.Context, clients *googleClients, rootFolderID
 		}
 	}
 
+	// Create (or skip if already present) the Members manifest for this space.
+	if len(t.RoomMembers) > 0 {
+		if err := createManifestIfMissing(ctx, clients, seriesFolderID, t.RoomMembers); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not create members manifest: %v\n", err)
+		}
+	}
+
 	return transcriptURL, summaryURL, nil
+}
+
+// createManifestIfMissing creates a "Members" Google Doc in folderID listing
+// all room members. If the document already exists in the folder it is left
+// untouched, so repeated runs do not create duplicates.
+func createManifestIfMissing(ctx context.Context, clients *googleClients, folderID string, members []RoomMember) error {
+	const manifestName = "Members"
+
+	// Check whether the doc already exists.
+	safeName := strings.ReplaceAll(manifestName, "'", `\'`)
+	q := fmt.Sprintf(
+		"name='%s' and mimeType='application/vnd.google-apps.document' and '%s' in parents and trashed=false",
+		safeName, folderID,
+	)
+	list, err := clients.drive.Files.List().Q(q).Fields("files(id)").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("querying for existing members manifest: %w", err)
+	}
+	if len(list.Files) > 0 {
+		return nil // already present
+	}
+
+	// Build the body: one line per member, moderators flagged.
+	var sb strings.Builder
+	for _, m := range members {
+		line := m.DisplayName
+		if m.Email != "" {
+			line += " <" + m.Email + ">"
+		}
+		if m.IsModerator {
+			line += " [Moderator]"
+		}
+		sb.WriteString(line + "\n")
+	}
+
+	_, err = createDocInFolder(ctx, clients, folderID, manifestName, "Members", sb.String())
+	return err
 }
 
 // createDocInFolder creates a new Google Doc with the given title inside

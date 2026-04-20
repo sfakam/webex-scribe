@@ -35,10 +35,17 @@ const (
 	// by default because it must be explicitly enabled in the Webex app
 	// integration and requires admin privileges. Add it to the integration scopes
 	// on developer.webex.com and pass --admin to include it at runtime.
-	webexScope      = "meeting:schedules_read meeting:transcripts_read meeting:summaries_read spark:rooms_read"
+	webexScope      = "meeting:schedules_read meeting:transcripts_read meeting:summaries_read spark:rooms_read spark:memberships_read"
 	webexAdminScope = "meeting:admin_transcript_read meeting:admin_summaries_read"
 	redirectURI = "http://localhost:47823/callback"
 )
+
+// RoomMember represents a single member of a Webex Space (room).
+type RoomMember struct {
+	DisplayName string
+	Email       string
+	IsModerator bool
+}
 
 // WebexClient wraps an authenticated HTTP client for the Webex REST API.
 type WebexClient struct {
@@ -48,6 +55,10 @@ type WebexClient struct {
 	// when many transcripts share the same space.
 	roomNameMu    sync.Mutex
 	roomNameCache map[string]string
+
+	// roomMembersCache caches roomId -> member list.
+	roomMembersMu    sync.Mutex
+	roomMembersCache map[string][]RoomMember
 }
 
 // Transcript holds the metadata, raw VTT content, and optional AI summary of
@@ -59,11 +70,16 @@ type Transcript struct {
 	// SpaceName is the human-readable Webex Space (room) title resolved from
 	// RoomID. It is empty for scheduled meetings that are not tied to a Space.
 	SpaceName string
+	// RoomID is the Webex Space roomId, used to fetch members.
+	RoomID    string
 	StartTime time.Time
 	Content   string
 	// AISummary is the AI-generated meeting summary. It is empty when the
 	// meeting had no AI summary or when the summary API returned an error.
 	AISummary string
+	// RoomMembers is the member list of the Webex Space. Empty for meetings
+	// not tied to a Space or when the memberships API returns an error.
+	RoomMembers []RoomMember
 }
 
 // newWebexClient returns a WebexClient authenticated with the Webex API.
@@ -373,11 +389,17 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			// Summary is optional — log and continue without it.
 			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
 		}
-		// Resolve the Space name when a roomId is present.
+		// Resolve the Space name and member list when a roomId is present.
 		var spaceName string
+		var members []RoomMember
 		if item.RoomID != "" {
 			if name, err := client.fetchRoomName(item.RoomID); err == nil {
 				spaceName = name
+			}
+			if m, err := client.fetchRoomMembers(item.RoomID); err == nil {
+				members = m
+			} else {
+				fmt.Fprintf(os.Stderr, "        note: could not fetch room members — %v\n", err)
 			}
 		}
 		transcripts = append(transcripts, Transcript{
@@ -385,9 +407,11 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			MeetingID:    item.MeetingID,
 			MeetingTitle: item.MeetingTopic,
 			SpaceName:    spaceName,
+			RoomID:       item.RoomID,
 			StartTime:    startTime,
 			Content:      content,
 			AISummary:    summary,
+			RoomMembers:  members,
 		})
 	}
 	return transcripts
@@ -427,6 +451,58 @@ func (c *WebexClient) fetchRoomName(roomID string) (string, error) {
 	c.roomNameCache[roomID] = room.Title
 	c.roomNameMu.Unlock()
 	return room.Title, nil
+}
+
+// fetchRoomMembers returns the members of the Webex Space identified by
+// roomID. Results are cached. Pagination is followed automatically.
+func (c *WebexClient) fetchRoomMembers(roomID string) ([]RoomMember, error) {
+	c.roomMembersMu.Lock()
+	if c.roomMembersCache == nil {
+		c.roomMembersCache = make(map[string][]RoomMember)
+	}
+	if members, ok := c.roomMembersCache[roomID]; ok {
+		c.roomMembersMu.Unlock()
+		return members, nil
+	}
+	c.roomMembersMu.Unlock()
+
+	var all []RoomMember
+	pageURL := fmt.Sprintf("%s/memberships?roomId=%s&max=1000", webexAPIBase, url.QueryEscape(roomID))
+	for pageURL != "" {
+		resp, err := c.httpClient.Get(pageURL)
+		if err != nil {
+			return nil, fmt.Errorf("fetching memberships for room %s: %w", roomID, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("memberships API returned %d for room %s", resp.StatusCode, roomID)
+		}
+		var result struct {
+			Items []struct {
+				PersonDisplayName string `json:"personDisplayName"`
+				PersonEmail       string `json:"personEmail"`
+				IsModerator       bool   `json:"isModerator"`
+			} `json:"items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decoding memberships for room %s: %w", roomID, err)
+		}
+		resp.Body.Close()
+		for _, item := range result.Items {
+			all = append(all, RoomMember{
+				DisplayName: item.PersonDisplayName,
+				Email:       item.PersonEmail,
+				IsModerator: item.IsModerator,
+			})
+		}
+		pageURL = parseLinkNext(resp.Header.Get("Link"))
+	}
+
+	c.roomMembersMu.Lock()
+	c.roomMembersCache[roomID] = all
+	c.roomMembersMu.Unlock()
+	return all, nil
 }
 
 // transcriptItem is the JSON shape returned by the Webex
