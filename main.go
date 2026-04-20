@@ -14,6 +14,13 @@ import (
 	"time"
 )
 
+// version is set at build time via:
+//
+//	go build -ldflags "-X main.version=$(git describe --tags --always --dirty)"
+//
+// Falls back to "dev" when built without the flag (e.g. `go run`).
+var version = "dev"
+
 // loadDotEnv reads a .env file from path and sets any key=value pairs as
 // environment variables, skipping keys that are already set in the process
 // environment. Lines beginning with '#' and blank lines are ignored.
@@ -95,6 +102,7 @@ func main() {
 	botMode := flag.Bool("bot", false, "Use WEBEX_BOT_TOKEN to list all spaces the bot is in and download transcripts into plx-webex-meetings/")
 	reauth := flag.Bool("reauth", false, "Force re-authentication with Webex (deletes saved token)")
 	googleReauth := flag.Bool("google-reauth", false, "Force re-authentication with Google (deletes saved token)")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true}
@@ -114,6 +122,11 @@ func main() {
 	}
 	helpAdvanced := flag.Bool("help-advanced", false, "Show all flags including advanced OAuth2 options")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("webex-scribe", version)
+		os.Exit(0)
+	}
 
 	if *helpAdvanced {
 		fmt.Fprintf(os.Stderr, "Usage of webex-scribe (all flags):\n")

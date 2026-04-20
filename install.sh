@@ -185,8 +185,9 @@ fi
 
 info "Building webex-scribe..."
 cd "${SRC_DIR}"
-go build -o webex-scribe .
-info "Binary built."
+VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+go build -ldflags "-X main.version=${VERSION}" -o webex-scribe .
+info "Binary built (version: ${VERSION})."
 
 # --------------------------------------------------------------------------- #
 # 6. Install binary to INSTALL_DIR
