@@ -271,48 +271,86 @@ func doOAuthFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, error)
 // any content. Filtering by content (e.g. deduplication) should be applied
 // to the returned items before calling downloadTranscriptItems.
 //
-// from and to must be in "YYYY-MM-DD" format; empty strings default to 30 days
-// ago and today (UTC) respectively. When spaceID is non-empty only transcripts
-// from meetings that took place in that Webex Space are returned.
-func listTranscriptItems(ctx context.Context, client *WebexClient, from, to, spaceID string) ([]transcriptItem, error) {
+// from and to must be in "YYYY-MM-DD" format. When both are empty the window
+// is [days] days ago → today. days is ignored when from/to are provided.
+// The total window is split into 30-day chunks automatically because the Webex
+// API truncates results for windows wider than ~30 days.
+// When spaceID is non-empty only transcripts from that Webex Space are returned.
+func listTranscriptItems(ctx context.Context, client *WebexClient, from, to string, days int, spaceID string) ([]transcriptItem, error) {
 	now := time.Now().UTC()
-	fromTime := now.AddDate(0, 0, -30)
-	toTime := now
 
-	if from != "" {
-		t, err := time.Parse("2006-01-02", from)
+	var fromTime, toTime time.Time
+	switch {
+	case from != "" && to != "":
+		ft, err := time.Parse("2006-01-02", from)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --from date %q: %w", from, err)
 		}
-		fromTime = t
-	}
-	if to != "" {
-		t, err := time.Parse("2006-01-02", to)
+		tt, err := time.Parse("2006-01-02", to)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --to date %q: %w", to, err)
 		}
-		// Include the full end day.
-		toTime = t.Add(24*time.Hour - time.Second)
-	}
-
-	firstPage := fmt.Sprintf(
-		"%s/meetingTranscripts?from=%s&to=%s&max=100",
-		webexAPIBase,
-		url.QueryEscape(fromTime.Format(time.RFC3339)),
-		url.QueryEscape(toTime.Format(time.RFC3339)),
-	)
-	if spaceID != "" {
-		firstPage += "&roomId=" + url.QueryEscape(spaceID)
-	}
-
-	var allItems []transcriptItem
-	for pageURL := firstPage; pageURL != ""; {
-		items, nextURL, err := listTranscriptPage(client, pageURL)
+		fromTime = ft
+		toTime = tt.Add(24*time.Hour - time.Second)
+	case from != "":
+		ft, err := time.Parse("2006-01-02", from)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid --from date %q: %w", from, err)
 		}
-		allItems = append(allItems, items...)
-		pageURL = nextURL
+		fromTime = ft
+		toTime = now
+	case to != "":
+		tt, err := time.Parse("2006-01-02", to)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --to date %q: %w", to, err)
+		}
+		toTime = tt.Add(24*time.Hour - time.Second)
+		fromTime = toTime.AddDate(0, 0, -days)
+	default:
+		if days <= 0 {
+			days = 30
+		}
+		fromTime = now.AddDate(0, 0, -days)
+		toTime = now
+	}
+
+	// Split the total window into 30-day chunks to avoid Webex API truncation.
+	const chunkDays = 30
+	seen := make(map[string]bool)
+	var allItems []transcriptItem
+
+	chunkStart := fromTime
+	for chunkStart.Before(toTime) {
+		chunkEnd := chunkStart.Add(chunkDays * 24 * time.Hour)
+		if chunkEnd.After(toTime) {
+			chunkEnd = toTime
+		}
+
+		firstPage := fmt.Sprintf(
+			"%s/meetingTranscripts?from=%s&to=%s&max=100",
+			webexAPIBase,
+			url.QueryEscape(chunkStart.Format(time.RFC3339)),
+			url.QueryEscape(chunkEnd.Format(time.RFC3339)),
+		)
+		if spaceID != "" {
+			firstPage += "&roomId=" + url.QueryEscape(spaceID)
+		}
+
+		for pageURL := firstPage; pageURL != ""; {
+			items, nextURL, err := listTranscriptPage(client, pageURL)
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range items {
+				if !seen[item.ID] {
+					seen[item.ID] = true
+					allItems = append(allItems, item)
+				}
+			}
+			pageURL = nextURL
+		}
+
+		chunkStart = chunkEnd
 	}
 	return allItems, nil
 }

@@ -115,7 +115,10 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 # Sync all transcripts from the last 30 days (default)
 ./webex-scribe
 
-# Specify a date range
+# Sync the last 180 days (auto-split into 30-day chunks)
+./webex-scribe --days 180
+
+# Specify an explicit date range
 ./webex-scribe --from 2026-03-01 --to 2026-03-31
 
 # Fetch from a specific Webex Space only
@@ -138,7 +141,8 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-from` | 30 days ago | Start date `YYYY-MM-DD` |
+| `-days` | 30 | How many days back to fetch (e.g. `180`). Ignored when `--from`/`--to` are set. Requests are split into 30-day chunks automatically. |
+| `-from` | *days ago* | Start date `YYYY-MM-DD` |
 | `-to` | today | End date `YYYY-MM-DD` |
 | `-space-id` | *(empty)* | Webex Space (room) ID to filter transcripts |
 | `-admin` | false | Include `meeting:admin_transcript_read` scope (org-wide transcripts) |

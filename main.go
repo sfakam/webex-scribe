@@ -87,8 +87,9 @@ func main() {
 
 	clientID := flag.String("client-id", "", "Webex OAuth2 client ID (or env WEBEX_CLIENT_ID)")
 	clientSecret := flag.String("client-secret", "", "Webex OAuth2 client secret (or env WEBEX_CLIENT_SECRET)")
-	from := flag.String("from", "", "Start date YYYY-MM-DD (default: 30 days ago)")
+	from := flag.String("from", "", "Start date YYYY-MM-DD (default: --days ago)")
 	to := flag.String("to", "", "End date YYYY-MM-DD (default: today)")
+	days := flag.Int("days", 30, "How many days back to fetch transcripts (default 30; up to 180+). Ignored when --from/--to are set.")
 	spaceID := flag.String("space-id", "", "Webex Space (room) ID to fetch transcripts from; omit for all meetings")
 	admin := flag.Bool("admin", false, "Include meeting:admin_transcript_read scope to fetch all org transcripts (requires scope enabled in Webex app integration)")
 	botMode := flag.Bool("bot", false, "Use WEBEX_BOT_TOKEN to list all spaces the bot is in and download transcripts into plx-webex-meetings/")
@@ -226,6 +227,8 @@ func main() {
 	fmt.Print("Listing transcripts")
 	if *from != "" || *to != "" {
 		fmt.Printf(" (from=%s to=%s)", *from, *to)
+	} else {
+		fmt.Printf(" (last %d days)", *days)
 	}
 	if *spaceID != "" {
 		fmt.Printf(" (space-id=%s)", *spaceID)
@@ -235,7 +238,7 @@ func main() {
 	}
 	fmt.Println("...")
 
-	allItems, err := listTranscriptItems(ctx, webexClient, *from, *to, *spaceID)
+	allItems, err := listTranscriptItems(ctx, webexClient, *from, *to, *days, *spaceID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -414,7 +417,7 @@ func runBotMode(ctx context.Context, clients *googleClients, from, to string) {
 
 	for i, space := range spaces {
 		fmt.Printf("[%d/%d] Checking space: %s\n", i+1, len(spaces), space.Title)
-		items, err := listTranscriptItems(ctx, botClient, from, to, space.ID)
+		items, err := listTranscriptItems(ctx, botClient, from, to, 30, space.ID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  [warn] listing transcripts failed: %v\n", err)
 			continue
