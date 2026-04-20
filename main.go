@@ -332,16 +332,18 @@ func main() {
 			for t := range work {
 				t0 := time.Now()
 				// Route based on space type:
-				//   no roomId / no space name → personal-room  (PMR or unlinked scheduled meeting)
-				//   SpaceType == "direct"      → direct-rooms   (1:1 space)
-				//   SpaceType == "group"        → shared-rooms   (team space)
+				//   no roomId               → personal-room  (PMR or unlinked scheduled meeting)
+				//   SpaceType == "direct"   → direct-rooms   (1:1 space)
+				//   SpaceType == "group"    → shared-rooms   (team space)
+				//   SpaceType == "" but     → shared-rooms   (room name lookup failed, but space exists)
+				//     RoomID is set
 				var targetFolderID string
 				switch {
-				case t.RoomID == "" || t.SpaceName == "":
+				case t.RoomID == "":
 					targetFolderID = personalFolderID
 				case t.SpaceType == "direct":
 					targetFolderID = directFolderID
-				default: // "group" or any future type
+				default: // "group", unknown type, or lookup failed but RoomID is set
 					targetFolderID = sharedFolderID
 				}
 				tURL, sURL, err := createMeetingDocs(ctx, clients, targetFolderID, t)
