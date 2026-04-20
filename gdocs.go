@@ -355,44 +355,48 @@ func gcloudAccessToken() (string, error) {
 	return tok, nil
 }
 
-// createMeetingDocs creates a meeting-level subfolder inside the appropriate
-// month folder and populates it with a Transcript doc and, when an AI summary
-// is available, a Summary doc.
+// createMeetingDocs creates (or reuses) a per-meeting-series folder directly
+// under rootFolderID and populates it with named docs for this occurrence.
+//
+// The folder is named after the Webex Space title when the transcript comes
+// from a Space meeting (t.SpaceName is set), otherwise the meeting topic is
+// used. All occurrences of the same series land in the same folder.
 //
 // The Drive folder hierarchy after this call is:
 //
 //	<rootFolderID>/
-//	  YYYY-MM/
-//	    <meeting title> — Jan 2, 2006/
-//	      Transcript
-//	      Summary          ← only when t.AISummary is non-empty
+//	  <Space or meeting title>/
+//	    <title> — Jan 2, 2006 — Transcript
+//	    <title> — Jan 2, 2006 — Summary   ← only when AI summary present
 //
 // It returns the URLs of the Transcript doc and the Summary doc. summaryURL is
 // empty when no AI summary was available.
 func createMeetingDocs(ctx context.Context, clients *googleClients, rootFolderID string, t Transcript) (transcriptURL, summaryURL string, err error) {
-	// Ensure the year-month subfolder, e.g. "2026-04".
-	monthFolder := t.StartTime.Format("2006-01")
-	monthFolderID, err := clients.ensureFolderCached(ctx, monthFolder, rootFolderID)
-	if err != nil {
-		return "", "", fmt.Errorf("ensuring month folder %q: %w", monthFolder, err)
+	// Use Space name as folder label when available, fall back to meeting topic.
+	folderLabel := t.MeetingTitle
+	if t.SpaceName != "" {
+		folderLabel = t.SpaceName
 	}
 
-	// Ensure a per-meeting subfolder titled "<meeting title> — Jan 2, 2006".
-	meetingFolderName := fmt.Sprintf("%s — %s", t.MeetingTitle, t.StartTime.Format("Jan 2, 2006"))
-	meetingFolderID, err := clients.ensureFolderCached(ctx, meetingFolderName, monthFolderID)
+	// Ensure a per-series folder.
+	seriesFolderID, err := clients.ensureFolderCached(ctx, folderLabel, rootFolderID)
 	if err != nil {
-		return "", "", fmt.Errorf("ensuring meeting folder %q: %w", meetingFolderName, err)
+		return "", "", fmt.Errorf("ensuring series folder %q: %w", folderLabel, err)
 	}
 
-	// Create the Transcript doc.
-	transcriptURL, err = createDocInFolder(ctx, clients, meetingFolderID, "Transcript", "Transcript", t.Content)
+	dateStr := t.StartTime.Format("Jan 2, 2006")
+
+	// Create the Transcript doc titled "<label> — <date> — Transcript".
+	transcriptTitle := fmt.Sprintf("%s — %s — Transcript", folderLabel, dateStr)
+	transcriptURL, err = createDocInFolder(ctx, clients, seriesFolderID, transcriptTitle, "Transcript", t.Content)
 	if err != nil {
 		return "", "", fmt.Errorf("creating transcript doc: %w", err)
 	}
 
 	// Create the Summary doc only when an AI summary was fetched.
 	if t.AISummary != "" {
-		summaryURL, err = createDocInFolder(ctx, clients, meetingFolderID, "Summary", "AI Summary", t.AISummary)
+		summaryTitle := fmt.Sprintf("%s — %s — Summary", folderLabel, dateStr)
+		summaryURL, err = createDocInFolder(ctx, clients, seriesFolderID, summaryTitle, "AI Summary", t.AISummary)
 		if err != nil {
 			return "", "", fmt.Errorf("creating summary doc: %w", err)
 		}

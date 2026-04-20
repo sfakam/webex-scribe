@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -42,6 +43,11 @@ const (
 // WebexClient wraps an authenticated HTTP client for the Webex REST API.
 type WebexClient struct {
 	httpClient *http.Client
+
+	// roomNameCache caches roomId -> room title to avoid redundant API calls
+	// when many transcripts share the same space.
+	roomNameMu    sync.Mutex
+	roomNameCache map[string]string
 }
 
 // Transcript holds the metadata, raw VTT content, and optional AI summary of
@@ -50,8 +56,11 @@ type Transcript struct {
 	ID           string
 	MeetingID    string
 	MeetingTitle string
-	StartTime    time.Time
-	Content      string
+	// SpaceName is the human-readable Webex Space (room) title resolved from
+	// RoomID. It is empty for scheduled meetings that are not tied to a Space.
+	SpaceName string
+	StartTime time.Time
+	Content   string
 	// AISummary is the AI-generated meeting summary. It is empty when the
 	// meeting had no AI summary or when the summary API returned an error.
 	AISummary string
@@ -326,10 +335,18 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			// Summary is optional — log and continue without it.
 			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
 		}
+		// Resolve the Space name when a roomId is present.
+		var spaceName string
+		if item.RoomID != "" {
+			if name, err := client.fetchRoomName(item.RoomID); err == nil {
+				spaceName = name
+			}
+		}
 		transcripts = append(transcripts, Transcript{
 			ID:           item.ID,
 			MeetingID:    item.MeetingID,
 			MeetingTitle: item.MeetingTopic,
+			SpaceName:    spaceName,
 			StartTime:    startTime,
 			Content:      content,
 			AISummary:    summary,
@@ -338,12 +355,49 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 	return transcripts
 }
 
+// fetchRoomName resolves a Webex roomId to its human-readable title.
+// Results are cached so repeated calls for the same room cost only one API
+// round-trip. Returns an error when the room cannot be found or the API fails.
+func (c *WebexClient) fetchRoomName(roomID string) (string, error) {
+	c.roomNameMu.Lock()
+	if c.roomNameCache == nil {
+		c.roomNameCache = make(map[string]string)
+	}
+	if name, ok := c.roomNameCache[roomID]; ok {
+		c.roomNameMu.Unlock()
+		return name, nil
+	}
+	c.roomNameMu.Unlock()
+
+	apiURL := webexAPIBase + "/rooms/" + url.PathEscape(roomID)
+	resp, err := c.httpClient.Get(apiURL)
+	if err != nil {
+		return "", fmt.Errorf("fetching room %s: %w", roomID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("rooms API returned %d for %s", resp.StatusCode, roomID)
+	}
+	var room struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&room); err != nil {
+		return "", fmt.Errorf("decoding room %s: %w", roomID, err)
+	}
+
+	c.roomNameMu.Lock()
+	c.roomNameCache[roomID] = room.Title
+	c.roomNameMu.Unlock()
+	return room.Title, nil
+}
+
 // transcriptItem is the JSON shape returned by the Webex
 // GET /meetingTranscripts list endpoint.
 type transcriptItem struct {
 	ID           string `json:"id"`
 	MeetingID    string `json:"meetingId"`
 	MeetingTopic string `json:"meetingTopic"`
+	RoomID       string `json:"roomId"`
 	StartTime    string `json:"startTime"`
 }
 

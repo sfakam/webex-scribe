@@ -94,15 +94,15 @@ Project `.env` values take precedence over `~/.webex-meeting-sync/.env`. Useful 
 
 ```
 webex-meetings/
-  2026-04/
-    Weekly Sync — Apr 15, 2026/
-      Transcript        ← raw VTT content
-      Summary           ← Webex AI summary + action items (if available)
-    Demo Review — Apr 9, 2026/
-      Transcript
-      Summary
-  2026-03/
-    ...
+  Chris:Sherif 1:1/
+    Chris:Sherif 1:1 — Apr 15, 2026 — Transcript
+    Chris:Sherif 1:1 — Apr 15, 2026 — Summary
+    Chris:Sherif 1:1 — Apr 1, 2026 — Transcript
+    Chris:Sherif 1:1 — Apr 1, 2026 — Summary
+  Demo Review — InfraSec Agentic Workflows/
+    Demo Review — InfraSec Agentic Workflows — Apr 9, 2026 — Transcript
+    Demo Review — InfraSec Agentic Workflows — Apr 9, 2026 — Summary
+  ...
 ```
 
 ## Deduplication
