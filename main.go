@@ -365,6 +365,7 @@ func main() {
 
 	fmt.Printf("\nDone! Uploaded: %d  Skipped (already uploaded): %d  Total time: %s\n",
 		uploaded, skipped, time.Since(uploadStart).Round(time.Second))
+	fmt.Printf("\n  webex-meetings folder: %s\n", makeFolderURL(rootFolderID))
 
 	// Bot mode: after the personal sync, also run the bot space sweep if
 	// --bot was requested.

@@ -525,3 +525,8 @@ func retryOnRateLimit(fn func() error) error {
 func makeDocURL(docID string) string {
 	return "https://docs.google.com/document/d/" + docID + "/edit"
 }
+
+// makeFolderURL returns the browser-accessible URL for a Google Drive folder.
+func makeFolderURL(folderID string) string {
+	return "https://drive.google.com/drive/folders/" + folderID
+}
