@@ -263,6 +263,7 @@ func main() {
 
 	if len(toDownload) == 0 {
 		fmt.Printf("\nAll %d transcript(s) already uploaded. Nothing to do.\n", skipped)
+		fmt.Printf("\n  webex-meetings folder: %s\n", makeFolderURL(rootFolderID))
 		return
 	}
 
