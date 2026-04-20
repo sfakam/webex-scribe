@@ -24,7 +24,6 @@ import (
 const (
 	webexAuthURL  = "https://webexapis.com/v1/authorize"
 	webexTokenURL = "https://webexapis.com/v1/access_token"
-	webexAPIBase  = "https://webexapis.com/v1"
 	// webexScope lists the OAuth2 scopes requested during authorization.
 	// - meeting:schedules_read      read scheduled meeting metadata
 	// - meeting:transcripts_read    read the authenticated user's own transcripts
@@ -39,6 +38,10 @@ const (
 	webexAdminScope = "meeting:admin_transcript_read meeting:admin_summaries_read"
 	redirectURI = "http://localhost:47823/callback"
 )
+
+// webexAPIBase is the base URL for all Webex REST API calls. It is a var so
+// tests can point it at a local httptest server.
+var webexAPIBase = "https://webexapis.com/v1"
 
 // RoomMember represents a single member of a Webex Space (room).
 type RoomMember struct {
