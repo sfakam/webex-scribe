@@ -9,11 +9,10 @@ Downloads meeting transcripts and AI summaries from Webex and creates one Google
 Run this single command — no need to clone the repo first:
 
 ```sh
-bash <(curl -fsSLk --cert ~/.certs/${USER}.crt --key ~/.certs/${USER}.key \
-  "https://git.source.akamai.com/rest/api/1.0/users/sfathall/repos/webex-scribe/raw/install.sh?at=refs/heads/main")
+bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
 ```
 
-> Requires Akamai mTLS client certs at `~/.certs/<username>.{crt,key}`.
+> Requires an SSH key configured for `git.source.akamai.com` (same key used to clone/push the repo).
 
 Or if you already have the repo cloned, run `setup.sh` instead:
 
