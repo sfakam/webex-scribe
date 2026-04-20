@@ -515,9 +515,21 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 	}
 
 	fmt.Printf("\nDry run — %d transcript(s) found:\n\n", len(allItems))
-	fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n", "Action", "Title", "Date", "Type", "Destination folder")
-	fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n",
-		"------", strings.Repeat("-", 40), "------------", "----------", strings.Repeat("-", 50))
+	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %s\n",
+		"Action", "Title", "Date", "Type", "MeetingID", "RoomID", "SeriesID", "Destination folder")
+	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %s\n",
+		"------", strings.Repeat("-", 35), "------------", "----------",
+		strings.Repeat("-", 24), strings.Repeat("-", 24), strings.Repeat("-", 24), strings.Repeat("-", 45))
+
+	truncID := func(s string) string {
+		if s == "" {
+			return "(none)"
+		}
+		if len(s) > 24 {
+			return s[:21] + "..."
+		}
+		return s
+	}
 
 	var toUpload, toSkip int
 	for _, item := range allItems {
@@ -587,21 +599,13 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 
 		folderPath := fmt.Sprintf("%s/%s/%s", rootFolderName, category, subFolder)
 		titleTrunc := item.MeetingTopic
-		if len(titleTrunc) > 40 {
-			titleTrunc = titleTrunc[:37] + "..."
+		if len(titleTrunc) > 35 {
+			titleTrunc = titleTrunc[:32] + "..."
 		}
-		fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n", action, titleTrunc, dateStr, meetingType, folderPath)
-
-		roomIDStr := item.RoomID
-		if roomIDStr == "" {
-			roomIDStr = "(none)"
-		}
-		seriesIDStr := item.MeetingSeriesID
-		if seriesIDStr == "" {
-			seriesIDStr = "(none)"
-		}
-		fmt.Printf("         meetingId=%-36s  roomId=%-36s  seriesId=%s\n",
-			item.MeetingID, roomIDStr, seriesIDStr)
+		fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %s\n",
+			action, titleTrunc, dateStr, meetingType,
+			truncID(item.MeetingID), truncID(item.RoomID), truncID(item.MeetingSeriesID),
+			folderPath)
 	}
 
 	fmt.Printf("\nTotal: %d to upload, %d already uploaded (would skip).\n", toUpload, toSkip)
