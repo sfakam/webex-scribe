@@ -3,9 +3,9 @@
 #
 # Designed to be run directly without cloning the repo first:
 #
-#   bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
+#   bash <(curl -fsSL "https://raw.githubusercontent.com/sfakam/webex-scribe/main/install.sh")
 #
-# Requires an SSH key configured for git.source.akamai.com.
+# Requires a GitHub account with access to the repo.
 #
 # What it does:
 #   1. Installs Go 1.22+ (Homebrew on macOS, tarball on Linux)
@@ -22,8 +22,8 @@
 
 set -euo pipefail
 
-REPO_SSH="ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git"
-REPO_HTTPS="https://git.source.akamai.com/scm/~sfathall/webex-scribe.git"
+REPO_SSH="git@github.com:sfakam/webex-scribe.git"
+REPO_HTTPS="https://github.com/sfakam/webex-scribe.git"
 SRC_DIR="${WEBEX_SCRIBE_SRC_DIR:-/tmp/webex-scribe-src}"
 INSTALL_DIR="${WEBEX_SCRIBE_INSTALL:-/usr/local/bin}"
 

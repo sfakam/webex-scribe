@@ -9,10 +9,10 @@ Downloads meeting transcripts and AI summaries from Webex and creates one Google
 Run this single command — no need to clone the repo first:
 
 ```sh
-bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
+bash <(curl -fsSL "https://raw.githubusercontent.com/sfakam/webex-scribe/main/install.sh")
 ```
 
-> Requires an SSH key configured for `git.source.akamai.com` (same key used to clone/push the repo).
+> No SSH key required — the script is fetched directly from GitHub.
 
 Or if you already have the repo cloned, run `setup.sh` instead:
 
