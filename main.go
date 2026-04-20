@@ -515,11 +515,11 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 	}
 
 	fmt.Printf("\nDry run — %d transcript(s) found:\n\n", len(allItems))
-	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %s\n",
-		"Action", "Title", "Date", "Type", "MeetingID", "RoomID", "SeriesID", "Destination folder")
-	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %s\n",
+	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %-12s  %-24s  %s\n",
+		"Action", "Title", "Date", "Type", "MeetingID", "RoomID", "SeriesID", "MeetingsAPI", "ResolvedRoomID", "Destination folder")
+	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %-12s  %-24s  %s\n",
 		"------", strings.Repeat("-", 35), "------------", "----------",
-		strings.Repeat("-", 24), strings.Repeat("-", 24), strings.Repeat("-", 24), strings.Repeat("-", 45))
+		strings.Repeat("-", 24), strings.Repeat("-", 24), strings.Repeat("-", 24), strings.Repeat("-", 12), strings.Repeat("-", 24), strings.Repeat("-", 45))
 
 	truncID := func(s string) string {
 		if s == "" {
@@ -549,8 +549,10 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 		var spaceName, spaceType string
 		skipTitleMatch := false
 		meetingType := "?"
+		meetingLookup := "err"
 
 		if details, err := webexClient.fetchMeetingDetails(item.MeetingID); err == nil {
+			meetingLookup = "ok"
 			if details.ScheduledType == "personalRoomMeeting" {
 				resolvedRoomID = ""
 				skipTitleMatch = true
@@ -558,6 +560,8 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 			} else if details.RoomID != "" {
 				resolvedRoomID = details.RoomID
 				skipTitleMatch = true
+				meetingType = details.ScheduledType
+			} else if details.ScheduledType != "" {
 				meetingType = details.ScheduledType
 			}
 		}
@@ -602,9 +606,9 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 		if len(titleTrunc) > 35 {
 			titleTrunc = titleTrunc[:32] + "..."
 		}
-		fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %s\n",
+		fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %-12s  %-24s  %s\n",
 			action, titleTrunc, dateStr, meetingType,
-			truncID(item.MeetingID), truncID(item.RoomID), truncID(item.MeetingSeriesID),
+			truncID(item.MeetingID), truncID(item.RoomID), truncID(item.MeetingSeriesID), truncID(meetingLookup), truncID(resolvedRoomID),
 			folderPath)
 	}
 
