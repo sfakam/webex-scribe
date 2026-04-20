@@ -3,17 +3,10 @@
 #
 # Designed to be run directly without cloning the repo first:
 #
-#   bash <(curl -fsSLk "https://git.source.akamai.com/rest/api/1.0/users/sfathall/repos/webex-scribe/raw/install.sh?at=refs/heads/main")
+#   bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
 #
-# macOS LibreSSL workaround (if curl gives SSL error):
-#   python3 -c "
-#   import urllib.request, ssl, subprocess
-#   ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-#   ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-#   subprocess.run(['bash'], input=urllib.request.urlopen(
-#     'https://git.source.akamai.com/rest/api/1.0/users/sfathall/repos/webex-scribe/raw/install.sh?at=refs/heads/main',
-#     context=ctx).read())
-#   "
+# Requires SSH key access to git.source.akamai.com.
+# HTTPS is not supported (server requires mTLS client certificates).
 #
 # What it does:
 #   1. Installs Go 1.22+ (Homebrew on macOS, tarball on Linux)

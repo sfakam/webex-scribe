@@ -9,21 +9,10 @@ Downloads meeting transcripts and AI summaries from Webex and creates one Google
 Run this single command — no need to clone the repo first:
 
 ```sh
-bash <(curl -fsSLk "https://git.source.akamai.com/rest/api/1.0/users/sfathall/repos/webex-scribe/raw/install.sh?at=refs/heads/main")
+bash <(git archive --remote=ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git HEAD install.sh | tar -xOf -)
 ```
 
-> **macOS only:** if `curl` fails with a LibreSSL SSL error, use this Python 3 alternative (avoids LibreSSL):
->
-> ```sh
-> python3 -c "
-> import urllib.request, ssl, subprocess
-> ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-> ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-> subprocess.run(['bash'], input=urllib.request.urlopen(
->   'https://git.source.akamai.com/rest/api/1.0/users/sfathall/repos/webex-scribe/raw/install.sh?at=refs/heads/main',
->   context=ctx).read())
-> "
-> ```
+> Requires an SSH key configured for `git.source.akamai.com`. HTTPS is not supported (the server requires mTLS client certificates).
 
 Or if you already have the repo cloned, run `setup.sh` instead:
 
