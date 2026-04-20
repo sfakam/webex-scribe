@@ -20,8 +20,9 @@
 
 set -euo pipefail
 
-REPO_URL="ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git"
-SRC_DIR="${WEBEX_SCRIBE_SRC_DIR:-${HOME}/webex-scribe-src}"
+REPO_SSH="ssh://git@git.source.akamai.com:7999/~sfathall/webex-scribe.git"
+REPO_HTTPS="https://git.source.akamai.com/scm/~sfathall/webex-scribe.git"
+SRC_DIR="${WEBEX_SCRIBE_SRC_DIR:-/tmp/webex-scribe-src}"
 INSTALL_DIR="${WEBEX_SCRIBE_INSTALL:-/usr/local/bin}"
 
 # --------------------------------------------------------------------------- #
@@ -43,7 +44,7 @@ echo "============================================================"
 echo " webex-scribe installer"
 echo "============================================================"
 echo ""
-echo " Source will be cloned to : ${SRC_DIR}"
+echo " Source will be cloned to : ${SRC_DIR} (in /tmp; deleted on reboot)"
 echo " Binary will be installed  : ${INSTALL_DIR}/webex-scribe"
 echo ""
 read -rp "Continue? [yes/no]: " REPLY
@@ -167,7 +168,13 @@ if [[ -d "${SRC_DIR}/.git" ]]; then
     git -C "${SRC_DIR}" pull --ff-only
 else
     info "Cloning webex-scribe into ${SRC_DIR}..."
-    git clone "${REPO_URL}" "${SRC_DIR}"
+    if git clone "${REPO_SSH}" "${SRC_DIR}" 2>/dev/null; then
+        info "Cloned via SSH."
+    else
+        warn "SSH clone failed (no SSH key?). Falling back to HTTPS..."
+        git clone "${REPO_HTTPS}" "${SRC_DIR}"
+        info "Cloned via HTTPS."
+    fi
 fi
 
 # --------------------------------------------------------------------------- #
