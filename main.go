@@ -280,6 +280,8 @@ func main() {
 	}
 
 	if *debug {
+		// Pre-fetch all rooms so the title lookup is visible in debug output.
+		allRooms, _ := webexClient.fetchAllRooms()
 		fmt.Printf("\n[DEBUG] %d transcript(s) returned by API:\n", len(allItems))
 		for _, item := range allItems {
 			roomLabel := "(no roomId — personal/PMR)"
@@ -289,6 +291,11 @@ func main() {
 					roomLabel += fmt.Sprintf(" type=%s name=%q", info.Type, info.Title)
 				} else {
 					roomLabel += fmt.Sprintf(" (room lookup failed: %v)", err)
+				}
+			} else if allRooms != nil {
+				key := strings.ToLower(item.MeetingTopic)
+				if matched, ok := allRooms[key]; ok {
+					roomLabel = fmt.Sprintf("(no roomId, title-matched → type=%s name=%q id=%s)", matched.Type, matched.Title, matched.ID)
 				}
 			}
 			t, _ := time.Parse(time.RFC3339, item.StartTime)

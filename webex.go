@@ -50,9 +50,10 @@ type RoomMember struct {
 	IsModerator bool
 }
 
-// RoomInfo holds the title and type of a Webex Space.
+// RoomInfo holds the title, type, and ID of a Webex Space.
 // Type values from the API: "direct" (1:1), "group" (shared team space).
 type RoomInfo struct {
+	ID    string
 	Title string
 	Type  string // "direct" or "group"
 }
@@ -64,6 +65,11 @@ type WebexClient struct {
 	// roomInfoCache caches roomId -> RoomInfo (title + type).
 	roomInfoMu    sync.Mutex
 	roomInfoCache map[string]RoomInfo
+
+	// allRoomsCache caches all the user's rooms keyed by lowercase title,
+	// used to match meeting topics to spaces when the API returns no roomId.
+	allRoomsMu    sync.Mutex
+	allRoomsCache map[string]RoomInfo // key: strings.ToLower(title)
 
 	// roomMembersCache caches roomId -> member list.
 	roomMembersMu    sync.Mutex
@@ -402,16 +408,34 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
 		}
 		// Resolve the Space name and member list when a roomId is present.
-		var spaceName, spaceType string
+		// When the API returns no roomId (common for PMR-hosted meetings),
+		// attempt to match the meeting topic against the user's room list.
+		var spaceName, spaceType, resolvedRoomID string
 		var members []RoomMember
-		if item.RoomID != "" {
-			if info, err := client.fetchRoomInfo(item.RoomID); err == nil {
+
+		resolvedRoomID = item.RoomID
+		if resolvedRoomID != "" {
+			if info, err := client.fetchRoomInfo(resolvedRoomID); err == nil {
 				spaceName = info.Title
 				spaceType = info.Type
 			} else {
-				fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", item.RoomID, err)
+				fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", resolvedRoomID, err)
 			}
-			if m, err := client.fetchRoomMembers(item.RoomID); err == nil {
+		} else {
+			// No roomId from API — try matching meeting topic against user's spaces.
+			if allRooms, err := client.fetchAllRooms(); err == nil {
+				key := strings.ToLower(item.MeetingTopic)
+				if matched, ok := allRooms[key]; ok {
+					resolvedRoomID = matched.ID
+					spaceName = matched.Title
+					spaceType = matched.Type
+					fmt.Fprintf(os.Stderr, "        note: matched %q to Space %q (type=%s) via title lookup\n", item.MeetingTopic, matched.Title, matched.Type)
+				}
+			}
+		}
+
+		if resolvedRoomID != "" {
+			if m, err := client.fetchRoomMembers(resolvedRoomID); err == nil {
 				members = m
 			} else {
 				fmt.Fprintf(os.Stderr, "        note: could not fetch room members — %v\n", err)
@@ -423,7 +447,7 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			MeetingTitle: item.MeetingTopic,
 			SpaceName:    spaceName,
 			SpaceType:    spaceType,
-			RoomID:       item.RoomID,
+			RoomID:       resolvedRoomID,
 			StartTime:    startTime,
 			Content:      content,
 			AISummary:    summary,
@@ -457,13 +481,14 @@ func (c *WebexClient) fetchRoomInfo(roomID string) (RoomInfo, error) {
 		return RoomInfo{}, fmt.Errorf("rooms API returned %d for %s", resp.StatusCode, roomID)
 	}
 	var room struct {
+		ID    string `json:"id"`
 		Title string `json:"title"`
 		Type  string `json:"type"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&room); err != nil {
 		return RoomInfo{}, fmt.Errorf("decoding room %s: %w", roomID, err)
 	}
-	info := RoomInfo{Title: room.Title, Type: room.Type}
+	info := RoomInfo{ID: room.ID, Title: room.Title, Type: room.Type}
 
 	c.roomInfoMu.Lock()
 	c.roomInfoCache[roomID] = info
@@ -476,6 +501,62 @@ func (c *WebexClient) fetchRoomInfo(roomID string) (RoomInfo, error) {
 func (c *WebexClient) fetchRoomName(roomID string) (string, error) {
 	info, err := c.fetchRoomInfo(roomID)
 	return info.Title, err
+}
+
+// fetchAllRooms returns a map of all Webex Spaces the authenticated user is a
+// member of, keyed by lowercase title. The result is cached after the first
+// call. It is used to resolve meeting-topic-to-room matches when the
+// /meetingTranscripts API returns no roomId (common for PMR-hosted meetings).
+func (c *WebexClient) fetchAllRooms() (map[string]RoomInfo, error) {
+	c.allRoomsMu.Lock()
+	if c.allRoomsCache != nil {
+		m := c.allRoomsCache
+		c.allRoomsMu.Unlock()
+		return m, nil
+	}
+	c.allRoomsMu.Unlock()
+
+	byTitle := make(map[string]RoomInfo)
+	pageURL := fmt.Sprintf("%s/rooms?max=1000", webexAPIBase)
+	for pageURL != "" {
+		resp, err := c.httpClient.Get(pageURL)
+		if err != nil {
+			return nil, fmt.Errorf("fetching room list: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("rooms list API returned %d", resp.StatusCode)
+		}
+		var result struct {
+			Items []struct {
+				ID    string `json:"id"`
+				Title string `json:"title"`
+				Type  string `json:"type"`
+			} `json:"items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decoding room list: %w", err)
+		}
+		resp.Body.Close()
+		for _, item := range result.Items {
+			info := RoomInfo{ID: item.ID, Title: item.Title, Type: item.Type}
+			byTitle[strings.ToLower(item.Title)] = info
+			// Also seed the per-room cache so fetchRoomInfo skips the API call.
+			c.roomInfoMu.Lock()
+			if c.roomInfoCache == nil {
+				c.roomInfoCache = make(map[string]RoomInfo)
+			}
+			c.roomInfoCache[item.ID] = info
+			c.roomInfoMu.Unlock()
+		}
+		pageURL = parseLinkNext(resp.Header.Get("Link"))
+	}
+
+	c.allRoomsMu.Lock()
+	c.allRoomsCache = byTitle
+	c.allRoomsMu.Unlock()
+	return byTitle, nil
 }
 
 // fetchRoomMembers returns the members of the Webex Space identified by
