@@ -58,6 +58,13 @@ type RoomInfo struct {
 	Type  string // "direct" or "group"
 }
 
+// MeetingDetails holds the room and scheduling type of a Webex meeting instance
+// returned by GET /meetings/{meetingId}.
+type MeetingDetails struct {
+	RoomID        string `json:"roomId"`
+	ScheduledType string `json:"scheduledType"` // "personalRoomMeeting", "meeting", "webinar"
+}
+
 // WebexClient wraps an authenticated HTTP client for the Webex REST API.
 type WebexClient struct {
 	httpClient *http.Client
@@ -74,6 +81,10 @@ type WebexClient struct {
 	// roomMembersCache caches roomId -> member list.
 	roomMembersMu    sync.Mutex
 	roomMembersCache map[string][]RoomMember
+
+	// meetingDetailsCache caches meetingId -> MeetingDetails (roomId + scheduledType).
+	meetingDetailsMu    sync.Mutex
+	meetingDetailsCache map[string]MeetingDetails
 }
 
 // Transcript holds the metadata, raw VTT content, and optional AI summary of
@@ -407,13 +418,32 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			// Summary is optional — log and continue without it.
 			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
 		}
-		// Resolve the Space name and member list when a roomId is present.
-		// When the API returns no roomId (common for PMR-hosted meetings),
-		// attempt to match the meeting topic against the user's room list.
+		// Resolve the Space name and member list.
+		// Resolution order:
+		//  1. GET /meetings/{meetingId} — authoritative; gives roomId and scheduledType.
+		//     scheduledType=="personalRoomMeeting" → route to personal-room regardless.
+		//  2. roomId from the transcript item (fallback when meetings API fails).
+		//  3. Title match against the user's room list (last resort).
 		var spaceName, spaceType, resolvedRoomID string
 		var members []RoomMember
 
 		resolvedRoomID = item.RoomID
+		skipTitleMatch := false
+
+		if details, err := client.fetchMeetingDetails(item.MeetingID); err == nil {
+			if details.ScheduledType == "personalRoomMeeting" {
+				// Definitively a Personal Meeting Room — clear any roomId and
+				// skip title matching so it routes to personal-room.
+				resolvedRoomID = ""
+				skipTitleMatch = true
+			} else if details.RoomID != "" {
+				resolvedRoomID = details.RoomID
+				skipTitleMatch = true
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "        note: meeting details lookup failed for %s — %v\n", item.MeetingID, err)
+		}
+
 		if resolvedRoomID != "" {
 			if info, err := client.fetchRoomInfo(resolvedRoomID); err == nil {
 				spaceName = info.Title
@@ -421,8 +451,8 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			} else {
 				fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", resolvedRoomID, err)
 			}
-		} else {
-			// No roomId from API — try matching meeting topic against user's spaces.
+		} else if !skipTitleMatch {
+			// No roomId resolved and not a confirmed PMR — try title match.
 			if allRooms, err := client.fetchAllRooms(); err == nil {
 				key := strings.ToLower(item.MeetingTopic)
 				if matched, ok := allRooms[key]; ok {
@@ -455,6 +485,41 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 		})
 	}
 	return transcripts
+}
+
+// fetchMeetingDetails fetches the roomId and scheduledType for a Webex meeting
+// instance from GET /meetings/{meetingId}. The scheduledType field definitively
+// identifies personal room meetings ("personalRoomMeeting") vs. ad-hoc or
+// space meetings ("meeting"/"webinar"). Results are cached.
+func (c *WebexClient) fetchMeetingDetails(meetingID string) (MeetingDetails, error) {
+	c.meetingDetailsMu.Lock()
+	if c.meetingDetailsCache == nil {
+		c.meetingDetailsCache = make(map[string]MeetingDetails)
+	}
+	if d, ok := c.meetingDetailsCache[meetingID]; ok {
+		c.meetingDetailsMu.Unlock()
+		return d, nil
+	}
+	c.meetingDetailsMu.Unlock()
+
+	apiURL := webexAPIBase + "/meetings/" + url.PathEscape(meetingID)
+	resp, err := c.httpClient.Get(apiURL)
+	if err != nil {
+		return MeetingDetails{}, fmt.Errorf("fetching meeting %s: %w", meetingID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return MeetingDetails{}, fmt.Errorf("meetings API returned %d for %s", resp.StatusCode, meetingID)
+	}
+	var d MeetingDetails
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return MeetingDetails{}, fmt.Errorf("decoding meeting %s: %w", meetingID, err)
+	}
+
+	c.meetingDetailsMu.Lock()
+	c.meetingDetailsCache[meetingID] = d
+	c.meetingDetailsMu.Unlock()
+	return d, nil
 }
 
 // fetchRoomInfo resolves a Webex roomId to its title and type ("direct" or

@@ -105,6 +105,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	debug := flag.Bool("debug", false, "Print raw transcript list with roomId and space type before uploading")
 	reroute := flag.Bool("reroute", false, "Re-upload all transcripts regardless of manifest, to correct folder routing")
+	dryRun := flag.Bool("dry-run", false, "List transcripts that would be downloaded and the Drive folder each would land in, without writing anything")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
@@ -192,6 +193,12 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	// Dry-run: authenticate Webex, list and resolve transcripts, print plan, exit.
+	if *dryRun {
+		runDryRun(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID)
+		return
+	}
 
 	// Authenticate with Google first so auth problems surface before the
 	// (potentially slow) Webex transcript download begins.
@@ -451,6 +458,143 @@ func main() {
 	if *botMode {
 		runBotMode(ctx, clients, *from, *to)
 	}
+}
+
+// runDryRun authenticates with both Webex and Google, loads the Drive manifest,
+// lists all transcripts in the requested window, resolves the target folder for
+// each via the meetings API, and prints an upload/skip plan without writing
+// anything to Drive or downloading any transcript content.
+func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, from, to string, days int, spaceID string) {
+	fmt.Println("Authenticating with Google (dry-run)...")
+	clients, err := newGoogleClients(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	rootFolderID, err := ensureFolder(ctx, clients.drive, rootFolderName, "root")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error ensuring Drive root folder: %v\n", err)
+		os.Exit(1)
+	}
+
+	mf, err := loadDriveManifest(ctx, clients.drive, rootFolderID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not load manifest (treating all as new): %v\n", err)
+		mf = &driveManifest{entries: make(map[string]manifestEntry), drive: clients.drive, folderID: rootFolderID}
+	}
+	fmt.Printf("Manifest loaded: %d previously uploaded transcript(s).\n\n", len(mf.entries))
+
+	fmt.Println("Authenticating with Webex (dry-run)...")
+	webexClient, err := newWebexClient(ctx, clientID, clientSecret, admin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Print("Listing transcripts")
+	if from != "" || to != "" {
+		fmt.Printf(" (from=%s to=%s)", from, to)
+	} else {
+		fmt.Printf(" (last %d days)", days)
+	}
+	if spaceID != "" {
+		fmt.Printf(" (space-id=%s)", spaceID)
+	}
+	fmt.Println("...")
+
+	allItems, err := listTranscriptItems(ctx, webexClient, from, to, days, spaceID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(allItems) == 0 {
+		fmt.Println("No transcripts found for the specified date range.")
+		return
+	}
+
+	fmt.Printf("\nDry run — %d transcript(s) found:\n\n", len(allItems))
+	fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n", "Action", "Title", "Date", "Type", "Destination folder")
+	fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n",
+		"------", strings.Repeat("-", 40), "------------", "----------", strings.Repeat("-", 50))
+
+	var toUpload, toSkip int
+	for _, item := range allItems {
+		t, _ := time.Parse(time.RFC3339, item.StartTime)
+		dateStr := t.Format("Jan 2, 2006")
+
+		action := "UPLOAD"
+		if mf.knownID(item.ID) {
+			action = "skip"
+			toSkip++
+		} else {
+			toUpload++
+		}
+
+		// Resolve routing — same logic as downloadTranscriptItems.
+		resolvedRoomID := item.RoomID
+		var spaceName, spaceType string
+		skipTitleMatch := false
+		meetingType := "?"
+
+		if details, err := webexClient.fetchMeetingDetails(item.MeetingID); err == nil {
+			if details.ScheduledType == "personalRoomMeeting" {
+				resolvedRoomID = ""
+				skipTitleMatch = true
+				meetingType = "PMR"
+			} else if details.RoomID != "" {
+				resolvedRoomID = details.RoomID
+				skipTitleMatch = true
+				meetingType = details.ScheduledType
+			}
+		}
+
+		if resolvedRoomID != "" {
+			if info, err := webexClient.fetchRoomInfo(resolvedRoomID); err == nil {
+				spaceName = info.Title
+				spaceType = info.Type
+				meetingType = info.Type
+			}
+		} else if !skipTitleMatch {
+			if allRooms, err := webexClient.fetchAllRooms(); err == nil {
+				key := strings.ToLower(item.MeetingTopic)
+				if matched, ok := allRooms[key]; ok {
+					resolvedRoomID = matched.ID
+					spaceName = matched.Title
+					spaceType = matched.Type
+					meetingType = matched.Type
+				}
+			}
+		}
+
+		var category, subFolder string
+		switch {
+		case resolvedRoomID == "":
+			category = "personal-room"
+			subFolder = item.MeetingTopic
+		case spaceType == "direct":
+			category = "direct-rooms"
+			subFolder = spaceName
+		default:
+			category = "shared-rooms"
+			if spaceName != "" {
+				subFolder = spaceName
+			} else {
+				subFolder = item.MeetingTopic
+			}
+		}
+
+		folderPath := fmt.Sprintf("%s/%s/%s", rootFolderName, category, subFolder)
+		titleTrunc := item.MeetingTopic
+		if len(titleTrunc) > 40 {
+			titleTrunc = titleTrunc[:37] + "..."
+		}
+		fmt.Printf("  %-6s  %-40s  %-12s  %-10s  %s\n", action, titleTrunc, dateStr, meetingType, folderPath)
+	}
+
+	fmt.Printf("\nTotal: %d to upload, %d already uploaded (would skip).\n", toUpload, toSkip)
+	fmt.Printf("Nothing written. Run without --dry-run to upload.\n")
 }
 
 // runBotMode uses WEBEX_BOT_TOKEN to list every space the bot is a member of,

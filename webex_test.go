@@ -499,6 +499,121 @@ func TestRoomMemberFields(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------- #
+// fetchMeetingDetails — via httptest server
+// --------------------------------------------------------------------------- #
+
+func TestFetchMeetingDetails_PersonalRoom(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meetings/pmr-meeting-1", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+			"scheduledType": "personalRoomMeeting",
+			"roomId":        "",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	origBase := webexAPIBase
+	webexAPIBase = srv.URL
+	defer func() { webexAPIBase = origBase }()
+
+	wc := &WebexClient{httpClient: srv.Client()}
+
+	d, err := wc.fetchMeetingDetails("pmr-meeting-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d.ScheduledType != "personalRoomMeeting" {
+		t.Errorf("ScheduledType = %q; want personalRoomMeeting", d.ScheduledType)
+	}
+	if d.RoomID != "" {
+		t.Errorf("RoomID = %q; want empty", d.RoomID)
+	}
+}
+
+func TestFetchMeetingDetails_SpaceMeeting(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meetings/space-meeting-1", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+			"scheduledType": "meeting",
+			"roomId":        "room-xyz",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	origBase := webexAPIBase
+	webexAPIBase = srv.URL
+	defer func() { webexAPIBase = origBase }()
+
+	wc := &WebexClient{httpClient: srv.Client()}
+
+	d, err := wc.fetchMeetingDetails("space-meeting-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d.ScheduledType != "meeting" {
+		t.Errorf("ScheduledType = %q; want meeting", d.ScheduledType)
+	}
+	if d.RoomID != "room-xyz" {
+		t.Errorf("RoomID = %q; want room-xyz", d.RoomID)
+	}
+}
+
+func TestFetchMeetingDetails_NotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meetings/missing-meeting", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	origBase := webexAPIBase
+	webexAPIBase = srv.URL
+	defer func() { webexAPIBase = origBase }()
+
+	wc := &WebexClient{httpClient: srv.Client()}
+
+	_, err := wc.fetchMeetingDetails("missing-meeting")
+	if err == nil {
+		t.Fatal("expected error for 404, got nil")
+	}
+}
+
+func TestFetchMeetingDetails_Caching(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meetings/cached-meeting", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+			"scheduledType": "meeting",
+			"roomId":        "room-cached",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	origBase := webexAPIBase
+	webexAPIBase = srv.URL
+	defer func() { webexAPIBase = origBase }()
+
+	wc := &WebexClient{httpClient: srv.Client()}
+
+	for i := range 4 {
+		d, err := wc.fetchMeetingDetails("cached-meeting")
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+		if d.RoomID != "room-cached" {
+			t.Errorf("call %d: RoomID = %q", i, d.RoomID)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 API call, got %d", calls)
+	}
+}
+
+// --------------------------------------------------------------------------- #
 // fetchRoomInfo concurrency — no data races
 // --------------------------------------------------------------------------- #
 
