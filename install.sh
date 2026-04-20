@@ -105,12 +105,19 @@ BUILT_FROM_SOURCE=false
 
 if [[ -n "${BINARY_SUFFIX}" ]]; then
     RELEASE_URL="${GITHUB_RELEASES}/webex-scribe-${BINARY_SUFFIX}"
-    info "Downloading pre-built binary for ${BINARY_SUFFIX}..."
-    if curl -fsSL --output "/tmp/webex-scribe" "${RELEASE_URL}" 2>/dev/null; then
+    info "Downloading pre-built binary: ${RELEASE_URL}"
+    HTTP_CODE=$(curl -fsSL \
+        --write-out "%{http_code} url=%{url_effective} size=%{size_download} time=%{time_total}s" \
+        --output "/tmp/webex-scribe" \
+        "${RELEASE_URL}" 2>&1) || CURL_EXIT=$?
+    CURL_EXIT="${CURL_EXIT:-0}"
+    info "Download result: exit=${CURL_EXIT} ${HTTP_CODE}"
+    if [[ "${CURL_EXIT}" -eq 0 && -s /tmp/webex-scribe ]]; then
         chmod +x /tmp/webex-scribe
         info "Downloaded: $(/tmp/webex-scribe --version)"
     else
-        warn "GitHub release download failed — falling back to building from source."
+        warn "GitHub release download failed (exit=${CURL_EXIT}) — falling back to building from source."
+        rm -f /tmp/webex-scribe
         BUILT_FROM_SOURCE=true
     fi
 else
