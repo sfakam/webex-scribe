@@ -103,9 +103,11 @@ func main() {
 	reauth := flag.Bool("reauth", false, "Force re-authentication with Webex (deletes saved token)")
 	googleReauth := flag.Bool("google-reauth", false, "Force re-authentication with Google (deletes saved token)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	debug := flag.Bool("debug", false, "Print raw transcript list with roomId and space type before uploading")
+	reroute := flag.Bool("reroute", false, "Re-upload all transcripts regardless of manifest, to correct folder routing")
 
 	// Advanced flags hidden from default --help output.
-	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true}
+	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of webex-scribe:\n")
 		flag.VisitAll(func(f *flag.Flag) {
@@ -277,12 +279,31 @@ func main() {
 		return
 	}
 
+	if *debug {
+		fmt.Printf("\n[DEBUG] %d transcript(s) returned by API:\n", len(allItems))
+		for _, item := range allItems {
+			roomLabel := "(no roomId — personal/PMR)"
+			if item.RoomID != "" {
+				roomLabel = "roomId=" + item.RoomID
+				if info, err := webexClient.fetchRoomInfo(item.RoomID); err == nil {
+					roomLabel += fmt.Sprintf(" type=%s name=%q", info.Type, info.Title)
+				} else {
+					roomLabel += fmt.Sprintf(" (room lookup failed: %v)", err)
+				}
+			}
+			t, _ := time.Parse(time.RFC3339, item.StartTime)
+			fmt.Printf("  %s (%s) — %s\n", item.MeetingTopic, t.Format("Jan 2, 2006"), roomLabel)
+		}
+		fmt.Println()
+	}
+
 	// Filter out transcripts already in the manifest before downloading any
 	// content — this avoids transferring data for transcripts we will skip.
+	// --reroute bypasses the manifest check to re-upload everything.
 	var toDownload []transcriptItem
 	var skipped int
 	for _, item := range allItems {
-		if mf.knownID(item.ID) {
+		if !*reroute && mf.knownID(item.ID) {
 			t, _ := time.Parse(time.RFC3339, item.StartTime)
 			fmt.Printf("  [skip] %s (%s) — already uploaded\n",
 				item.MeetingTopic, t.Format("Jan 2, 2006"))
