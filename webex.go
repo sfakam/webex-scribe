@@ -863,7 +863,9 @@ func saveUserToken(token string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
-	content := fmt.Sprintf("WEBEX_TOKEN=%q\n", token)
+	// Write without quoting so the file reads back cleanly without any
+	// quote-stripping logic.
+	content := fmt.Sprintf("WEBEX_TOKEN=%s\n", token)
 	return os.WriteFile(path, []byte(content), 0600)
 }
 
@@ -943,9 +945,11 @@ func ensureWebexToken() error {
 		return nil
 	}
 
-	// Recovery path: if env token is stale (or empty), try the saved user token.
+	// Recovery path: re-read the saved token from disk since the boot-time
+	// force-load may have raced with a concurrent save, or the shell env may
+	// have overridden it after startup.
 	savedToken, savedErr := readTokenFromEnvFile(userConfigPath(), "WEBEX_TOKEN")
-	if savedErr == nil && savedToken != "" && savedToken != token {
+	if savedErr == nil && savedToken != "" {
 		if name, err := validateWebexToken(savedToken); err == nil {
 			os.Setenv("WEBEX_TOKEN", savedToken)
 			fmt.Printf("Using saved Webex token from %s — signed in as %s.\n", userConfigPath(), name)

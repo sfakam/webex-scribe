@@ -80,13 +80,15 @@ func loadDotEnv(path string) error {
 // Each document URL is printed to stdout. Errors for individual transcripts
 // are reported as warnings; the tool continues processing the remaining ones.
 func main() {
-	// Load user-level config (~/.webex-meeting-sync/.env) first so a recently
-	// saved WEBEX_TOKEN is reused on the next run.
-	if err := loadDotEnv(userConfigPath()); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not load user config: %v\n", err)
+	// Always force-load WEBEX_TOKEN from user config, overriding any stale
+	// value exported in the calling shell (e.g. from ~/.zshrc). loadDotEnv
+	// has a "don't override" policy, so we read the token directly here.
+	if tok, err := readTokenFromEnvFile(userConfigPath(), "WEBEX_TOKEN"); err == nil && tok != "" {
+		os.Setenv("WEBEX_TOKEN", tok)
 	}
-	// Load project .env second for defaults like WEBEX_CLIENT_ID and
-	// WEBEX_CLIENT_SECRET. loadDotEnv does not override already-set variables.
+	// Load project .env for other settings like WEBEX_CLIENT_ID and
+	// WEBEX_CLIENT_SECRET. Does not override already-set variables (including
+	// the WEBEX_TOKEN we just loaded above).
 	if err := loadDotEnv(".env"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not load .env: %v\n", err)
 	}
@@ -153,10 +155,11 @@ func main() {
 		*clientSecret = os.Getenv("WEBEX_CLIENT_SECRET")
 	}
 
-	// If no WEBEX_TOKEN and no OAuth2 client credentials, prompt the user
-	// for a personal access token now — before the usingOAuth check so the
-	// prompt runs instead of exiting with an error.
-	if !*botMode && *clientID == "" && os.Getenv("WEBEX_TOKEN") == "" {
+	// Authenticate with Webex before anything else: validate or obtain a
+	// personal access token. This runs unconditionally in PAT mode so the user
+	// is never prompted mid-run after Google auth has already started.
+	fmt.Println("Authenticating with Webex...")
+	if !*botMode && *clientID == "" {
 		if err := ensureWebexToken(); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -245,15 +248,6 @@ func main() {
 	}
 	fmt.Printf("Manifest loaded: %d previously uploaded transcript(s).\n\n", len(mf.entries))
 
-	fmt.Println("Authenticating with Webex...")
-	// Re-validate the token if we haven't already prompted (i.e. WEBEX_TOKEN
-	// was already set from the environment or .env before we started).
-	if !*botMode && *clientID == "" && os.Getenv("WEBEX_TOKEN") != "" {
-		if err := ensureWebexToken(); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-	}
 	webexClient, err := newWebexClient(ctx, *clientID, *clientSecret, *admin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
