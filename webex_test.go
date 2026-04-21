@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -495,6 +497,48 @@ func TestRoomMemberFields(t *testing.T) {
 	}
 	if !m.IsModerator {
 		t.Error("IsModerator should be true")
+	}
+}
+
+func TestEnsureWebexToken_FallsBackToSavedUserToken(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/people/me", func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		switch auth {
+		case "Bearer good-token":
+			json.NewEncoder(w).Encode(map[string]string{"displayName": "Sherif"}) //nolint:errcheck
+		default:
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	origBase := webexAPIBase
+	webexAPIBase = srv.URL
+	defer func() { webexAPIBase = origBase }()
+
+	home := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+
+	cfgPath := filepath.Join(home, ".webex-meeting-sync", ".env")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, []byte("WEBEX_TOKEN=good-token\n"), 0600); err != nil {
+		t.Fatalf("write user token: %v", err)
+	}
+
+	os.Setenv("WEBEX_TOKEN", "bad-token")
+	t.Cleanup(func() { os.Unsetenv("WEBEX_TOKEN") })
+
+	if err := ensureWebexToken(); err != nil {
+		t.Fatalf("ensureWebexToken: %v", err)
+	}
+	if got := os.Getenv("WEBEX_TOKEN"); got != "good-token" {
+		t.Fatalf("WEBEX_TOKEN = %q; want %q", got, "good-token")
 	}
 }
 

@@ -897,13 +897,43 @@ func validateWebexToken(token string) (string, error) {
 	return me.DisplayName, nil
 }
 
+// readTokenFromEnvFile reads key=value lines from path and returns the value
+// for key, stripping optional surrounding single/double quotes.
+func readTokenFromEnvFile(path, key string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) != key {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 {
+			if (v[0] == '"' && v[len(v)-1] == '"') ||
+				(v[0] == '\'' && v[len(v)-1] == '\'') {
+				v = v[1 : len(v)-1]
+			}
+		}
+		return v, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("%s not set in %s", key, path)
+}
+
 // ensureWebexToken checks that WEBEX_TOKEN is set and valid. When it is
-// missing or expired, the user is prompted to paste a new token from
-// https://developer.webex.com. The new token is validated, saved to the user
-// config file (~/.webex-meeting-sync/.env), and set in the process environment
-// so subsequent code sees it immediately.
-//
-// This function is a no-op when the existing token is valid.
+// missing or expired, it first tries the persisted token in user config and
+// only prompts when no valid token is available.
 func ensureWebexToken() error {
 	token := os.Getenv("WEBEX_TOKEN")
 
@@ -911,6 +941,16 @@ func ensureWebexToken() error {
 	if name, err := validateWebexToken(token); err == nil {
 		fmt.Printf("Webex token valid — signed in as %s.\n", name)
 		return nil
+	}
+
+	// Recovery path: if env token is stale (or empty), try the saved user token.
+	savedToken, savedErr := readTokenFromEnvFile(userConfigPath(), "WEBEX_TOKEN")
+	if savedErr == nil && savedToken != "" && savedToken != token {
+		if name, err := validateWebexToken(savedToken); err == nil {
+			os.Setenv("WEBEX_TOKEN", savedToken)
+			fmt.Printf("Using saved Webex token from %s — signed in as %s.\n", userConfigPath(), name)
+			return nil
+		}
 	}
 
 	if token != "" {
