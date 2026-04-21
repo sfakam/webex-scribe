@@ -6,9 +6,13 @@ BINARY  := webex-scribe
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) .
+	@echo ""
+	@echo "  Built ./$(BINARY) — run 'make install' to update /usr/local/bin/$(BINARY)"
+	@echo ""
 
 install: build
 	sudo install -m 755 $(BINARY) /usr/local/bin/$(BINARY)
+	@echo "Installed /usr/local/bin/$(BINARY)"
 
 unit-test:
 	go test -v -race ./...
