@@ -124,3 +124,32 @@ func TestLoadDotEnv_LineWithoutEquals(t *testing.T) {
 		t.Errorf("GOOD = %q; want %q", got, "value")
 	}
 }
+
+func TestLoadDotEnv_UserConfigPrecedenceForWebexToken(t *testing.T) {
+	userDir := t.TempDir()
+	projectDir := t.TempDir()
+	userEnv := filepath.Join(userDir, ".env")
+	projectEnv := filepath.Join(projectDir, ".env")
+
+	if err := os.WriteFile(userEnv, []byte("WEBEX_TOKEN=user-token\n"), 0600); err != nil {
+		t.Fatalf("writing user .env: %v", err)
+	}
+	if err := os.WriteFile(projectEnv, []byte("WEBEX_TOKEN=stale-project-token\n"), 0600); err != nil {
+		t.Fatalf("writing project .env: %v", err)
+	}
+
+	os.Unsetenv("WEBEX_TOKEN")
+	t.Cleanup(func() { os.Unsetenv("WEBEX_TOKEN") })
+
+	// Match startup order in main(): load user config first, then project .env.
+	if err := loadDotEnv(userEnv); err != nil {
+		t.Fatalf("loadDotEnv user config: %v", err)
+	}
+	if err := loadDotEnv(projectEnv); err != nil {
+		t.Fatalf("loadDotEnv project .env: %v", err)
+	}
+
+	if got := os.Getenv("WEBEX_TOKEN"); got != "user-token" {
+		t.Fatalf("WEBEX_TOKEN = %q; want %q", got, "user-token")
+	}
+}

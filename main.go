@@ -80,16 +80,15 @@ func loadDotEnv(path string) error {
 // Each document URL is printed to stdout. Errors for individual transcripts
 // are reported as warnings; the tool continues processing the remaining ones.
 func main() {
-	// Load .env from the working directory before parsing flags so that
-	// WEBEX_CLIENT_ID and WEBEX_CLIENT_SECRET are available as fallbacks.
-	if err := loadDotEnv(".env"); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not load .env: %v\n", err)
-	}
-	// Load the user-level config (~/.webex-meeting-sync/.env) which stores the
-	// persisted WEBEX_TOKEN. Project .env takes precedence (already loaded above
-	// sets the env var, so loadDotEnv won't override it).
+	// Load user-level config (~/.webex-meeting-sync/.env) first so a recently
+	// saved WEBEX_TOKEN is reused on the next run.
 	if err := loadDotEnv(userConfigPath()); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not load user config: %v\n", err)
+	}
+	// Load project .env second for defaults like WEBEX_CLIENT_ID and
+	// WEBEX_CLIENT_SECRET. loadDotEnv does not override already-set variables.
+	if err := loadDotEnv(".env"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not load .env: %v\n", err)
 	}
 
 	clientID := flag.String("client-id", "", "Webex OAuth2 client ID (or env WEBEX_CLIENT_ID)")
