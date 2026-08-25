@@ -100,13 +100,16 @@ func main() {
 	days := flag.Int("days", 30, "How many days back to fetch transcripts (default 30; up to 180+). Ignored when --from/--to are set.")
 	spaceID := flag.String("space-id", "", "Webex Space (room) ID to fetch transcripts from; omit for all meetings")
 	admin := flag.Bool("admin", false, "Include meeting:admin_transcript_read scope to fetch all org transcripts (requires scope enabled in Webex app integration)")
-	botMode := flag.Bool("bot", false, "Use WEBEX_BOT_TOKEN to list all spaces the bot is in and download transcripts into plx-webex-meetings/")
+	botMode := flag.Bool("bot", false, "Use WEBEX_BOT_TOKEN to list all spaces the bot is in and download transcripts into webex-meetings/")
 	reauth := flag.Bool("reauth", false, "Force re-authentication with Webex (deletes saved token)")
 	googleReauth := flag.Bool("google-reauth", false, "Force re-authentication with Google (deletes saved token)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	debug := flag.Bool("debug", false, "Print raw transcript list with roomId and space type before uploading")
 	reroute := flag.Bool("reroute", false, "Re-upload all transcripts regardless of manifest, to correct folder routing")
-	dryRun := flag.Bool("dry-run", false, "List transcripts that would be downloaded and the Drive folder each would land in, without writing anything")
+	dryRun    := flag.Bool("dry-run", false, "List transcripts that would be downloaded and the Drive folder each would land in, without writing anything")
+	local     := flag.Bool("local", false, "Save transcripts to local markdown files instead of uploading to Google Docs (skips Google auth)")
+	outputDir := flag.String("output-dir", "", "Output directory for --local and --calendar modes (default: ~/webex-scribe-home)")
+	mySchedule := flag.Int("calendar", 0, "Write a local markdown agenda: positive N = next N days, negative N = past N days (e.g. --calendar 7, --calendar -7)")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
@@ -126,6 +129,11 @@ func main() {
 	}
 	helpAdvanced := flag.Bool("help-advanced", false, "Show all flags including advanced OAuth2 options")
 	flag.Parse()
+
+	if *outputDir == "" {
+		home, _ := os.UserHomeDir()
+		*outputDir = home + "/webex-scribe-home"
+	}
 
 	if *showVersion {
 		fmt.Println("webex-scribe", version)
@@ -199,6 +207,20 @@ func main() {
 	// Dry-run: authenticate Webex, list and resolve transcripts, print plan, exit.
 	if *dryRun {
 		runDryRun(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID)
+		return
+	}
+
+	// Schedule mode: fetch past or future meetings and write a local markdown
+	// agenda. Positive N = next N days; negative N = past N days.
+	if *mySchedule != 0 {
+		runScheduleMode(ctx, *clientID, *clientSecret, *admin, *mySchedule, *outputDir)
+		return
+	}
+
+	// Local transcript mode: download transcripts and save as markdown files.
+	// Skips Google auth entirely.
+	if *local {
+		runLocalTranscriptMode(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID, *outputDir)
 		return
 	}
 
@@ -607,6 +629,131 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 
 	fmt.Printf("\nTotal: %d to upload, %d already uploaded (would skip).\n", toUpload, toSkip)
 	fmt.Printf("Nothing written. Run without --dry-run to upload.\n")
+}
+
+// runScheduleMode fetches scheduled Webex meetings for a time window and
+// writes them as a local markdown agenda file. days > 0 = next N days;
+// days < 0 = past N days. No Google auth required.
+func runScheduleMode(ctx context.Context, clientID, clientSecret string, adminMode bool, days int, outputDir string) {
+	fmt.Println("Authenticating with Webex...")
+	webexClient, err := newWebexClient(ctx, clientID, clientSecret, adminMode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	now := time.Now().UTC()
+	var from, to time.Time
+	var direction string
+	if days > 0 {
+		from = now
+		to = now.Add(time.Duration(days) * 24 * time.Hour)
+		direction = fmt.Sprintf("next %d day(s)", days)
+	} else {
+		from = now.Add(time.Duration(days) * 24 * time.Hour) // days is negative
+		to = now
+		direction = fmt.Sprintf("past %d day(s)", -days)
+	}
+	windowLabel := fmt.Sprintf("%s to %s", from.Format("2006-01-02"), to.Format("2006-01-02"))
+
+	fmt.Printf("Fetching meetings for the %s (%s)...\n", direction, windowLabel)
+	meetings, err := webexClient.fetchScheduledMeetings(from, to)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Found %d meeting(s).\n", len(meetings))
+
+	calendarDir := outputDir + "/webex-calendar"
+	path, err := upsertCalendarJSON(calendarDir, meetings)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error writing calendar: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Calendar updated:", path)
+}
+
+// runLocalTranscriptMode downloads transcripts for the requested window and
+// saves them as markdown files to outputDir. Deduplication uses a local JSON
+// manifest (.wts-manifest.json) inside outputDir. Google auth is not required.
+func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, adminMode bool, from, to string, days int, spaceID, outputDir string) {
+	fmt.Println("Authenticating with Webex...")
+	webexClient, err := newWebexClient(ctx, clientID, clientSecret, adminMode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Print("Listing transcripts")
+	if from != "" || to != "" {
+		fmt.Printf(" (from=%s to=%s)", from, to)
+	} else {
+		fmt.Printf(" (last %d days)", days)
+	}
+	if spaceID != "" {
+		fmt.Printf(" (space-id=%s)", spaceID)
+	}
+	fmt.Println("...")
+
+	allItems, err := listTranscriptItems(ctx, webexClient, from, to, days, spaceID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(allItems) == 0 {
+		fmt.Println("No transcripts found for the specified date range.")
+		return
+	}
+
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error creating output dir: %v\n", err)
+		os.Exit(1)
+	}
+	lm := loadLocalManifest(outputDir)
+	fmt.Printf("Local manifest: %d previously saved transcript(s).\n\n", len(lm.entries))
+
+	var toDownload []transcriptItem
+	var skipped int
+	for _, item := range allItems {
+		if lm.known(item.ID) {
+			t, _ := time.Parse(time.RFC3339, item.StartTime)
+			fmt.Printf("  [skip] %s (%s) — already saved\n", item.MeetingTopic, t.Format("Jan 2, 2006"))
+			skipped++
+		} else {
+			toDownload = append(toDownload, item)
+		}
+	}
+
+	if len(toDownload) == 0 {
+		fmt.Printf("\nAll %d transcript(s) already saved. Nothing to do.\n", skipped)
+		fmt.Println("Output directory:", outputDir)
+		return
+	}
+
+	fmt.Printf("\nDownloading %d new transcript(s)...\n", len(toDownload))
+	transcripts := downloadTranscriptItems(webexClient, toDownload)
+
+	var saved int
+	for _, t := range transcripts {
+		path, err := writeTranscriptLocally(outputDir, t)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [error] %s: %v\n", t.MeetingTitle, err)
+			continue
+		}
+		if err := lm.record(t.ID, localEntry{
+			Title:       t.MeetingTitle,
+			MeetingDate: t.StartTime.UTC().Format("2006-01-02"),
+			Path:        path,
+			WrittenAt:   time.Now().UTC(),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: manifest update failed for %q: %v\n", t.MeetingTitle, err)
+		}
+		fmt.Printf("  [saved] %s (%s)\n    %s\n", t.MeetingTitle, t.StartTime.Format("Jan 2, 2006"), path)
+		saved++
+	}
+
+	fmt.Printf("\nDone! Saved: %d  Skipped (already saved): %d\n", saved, skipped)
+	fmt.Println("Output directory:", outputDir)
 }
 
 // runBotMode uses WEBEX_BOT_TOKEN to list every space the bot is a member of,

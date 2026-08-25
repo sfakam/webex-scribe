@@ -6,3 +6,6 @@ webex-scribe
 
 # Go test cache
 *.test
+
+# Runtime output — transcript and calendar data written by the tool
+webex-meetings/

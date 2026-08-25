@@ -34,7 +34,7 @@ const (
 	// by default because it must be explicitly enabled in the Webex app
 	// integration and requires admin privileges. Add it to the integration scopes
 	// on developer.webex.com and pass --admin to include it at runtime.
-	webexScope      = "meeting:schedules_read meeting:transcripts_read meeting:summaries_read spark:rooms_read spark:memberships_read"
+	webexScope      = "meeting:schedules_read meeting:transcripts_read spark:rooms_read spark:memberships_read"
 	webexAdminScope = "meeting:admin_transcript_read meeting:admin_summaries_read"
 	redirectURI = "http://localhost:47823/callback"
 )
@@ -1008,6 +1008,77 @@ func newBotClient(ctx context.Context) (*WebexClient, error) {
 	fmt.Println("Using WEBEX_BOT_TOKEN.")
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok})
 	return &WebexClient{httpClient: oauth2.NewClient(ctx, ts)}, nil
+}
+
+// ScheduledMeeting holds metadata for a Webex scheduled meeting returned by
+// GET /meetings. Used by --upcoming to display the forward-looking calendar.
+type ScheduledMeeting struct {
+	ID              string
+	Title           string
+	Start           time.Time
+	End             time.Time
+	Agenda          string
+	HostDisplayName string
+	WebLink         string
+	Status          string // "scheduled", "ready", "inProgress", "ended", etc.
+}
+
+// fetchScheduledMeetings returns all meetings in [from, to] from the Webex
+// meetings schedule API. Both past and future meetings are returned; the
+// caller controls the window via from/to. Pagination is followed automatically.
+func (c *WebexClient) fetchScheduledMeetings(from, to time.Time) ([]ScheduledMeeting, error) {
+	firstPage := fmt.Sprintf(
+		"%s/meetings?from=%s&to=%s&max=100",
+		webexAPIBase,
+		url.QueryEscape(from.UTC().Format(time.RFC3339)),
+		url.QueryEscape(to.UTC().Format(time.RFC3339)),
+	)
+
+	var all []ScheduledMeeting
+	for pageURL := firstPage; pageURL != ""; {
+		resp, err := c.httpClient.Get(pageURL)
+		if err != nil {
+			return nil, fmt.Errorf("fetching schedule: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("meetings API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var result struct {
+			Items []struct {
+				ID              string `json:"id"`
+				Title           string `json:"title"`
+				Start           string `json:"start"`
+				End             string `json:"end"`
+				Agenda          string `json:"agenda"`
+				HostDisplayName string `json:"hostDisplayName"`
+				WebLink         string `json:"webLink"`
+				Status          string `json:"status"`
+			} `json:"items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decoding schedule: %w", err)
+		}
+		resp.Body.Close()
+		for _, item := range result.Items {
+			start, _ := time.Parse(time.RFC3339, item.Start)
+			end, _ := time.Parse(time.RFC3339, item.End)
+			all = append(all, ScheduledMeeting{
+				ID:              item.ID,
+				Title:           item.Title,
+				Start:           start,
+				End:             end,
+				Agenda:          item.Agenda,
+				HostDisplayName: item.HostDisplayName,
+				WebLink:         item.WebLink,
+				Status:          item.Status,
+			})
+		}
+		pageURL = parseLinkNext(resp.Header.Get("Link"))
+	}
+	return all, nil
 }
 
 // listBotSpaces returns all Webex Spaces the bot is a member of. It follows
