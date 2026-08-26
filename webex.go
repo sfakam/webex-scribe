@@ -856,6 +856,16 @@ func userConfigPath() string {
 	return filepath.Join(home, ".webex-meeting-sync", ".env")
 }
 
+// isTerminal reports whether f is connected to an interactive terminal.
+// Uses only the standard library — no external dependency required.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 // saveUserToken writes WEBEX_TOKEN=<token> to the user config file, creating
 // the directory if needed. Existing content is replaced.
 func saveUserToken(token string) error {
@@ -958,10 +968,19 @@ func ensureWebexToken() error {
 	}
 
 	if token != "" {
-		fmt.Println("Webex token is expired or invalid — a new token is required.")
+		fmt.Fprintln(os.Stderr, "WEBEX_TOKEN_EXPIRED: token is expired or invalid — a new token is required.")
 	} else {
-		fmt.Println("No Webex token found.")
+		fmt.Fprintln(os.Stderr, "WEBEX_TOKEN_EXPIRED: no Webex token found.")
 	}
+
+	// When stdin is not a terminal (e.g. running as a subprocess under Claude),
+	// exit with code 2 so the caller can detect auth failure and re-invoke with --token.
+	if !isTerminal(os.Stdin) {
+		fmt.Fprintln(os.Stderr, "Run: webex-scribe --token <your-token>")
+		fmt.Fprintln(os.Stderr, "Get a token at: https://developer.webex.com/docs/getting-started")
+		os.Exit(2)
+	}
+
 	fmt.Println()
 	fmt.Println("  1. Open https://developer.webex.com/docs/getting-started")
 	fmt.Println("  2. Sign in and copy the Personal Access Token (valid for 12 hours).")

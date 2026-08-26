@@ -110,6 +110,7 @@ func main() {
 	local     := flag.Bool("local", false, "Save transcripts to local markdown files instead of uploading to Google Docs (skips Google auth)")
 	outputDir := flag.String("output-dir", "", "Output directory for --local and --calendar modes (default: ~/webex-scribe-home)")
 	mySchedule := flag.Int("calendar", 0, "Write a local markdown agenda: positive N = next N days, negative N = past N days (e.g. --calendar 7, --calendar -7)")
+	tokenArg  := flag.String("token", "", "Webex Personal Access Token — validated, saved to disk, and used for this run (skips interactive prompt)")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
@@ -161,6 +162,21 @@ func main() {
 	}
 	if *clientSecret == "" {
 		*clientSecret = os.Getenv("WEBEX_CLIENT_SECRET")
+	}
+
+	// --token: validate the supplied token, save it, and inject it so the rest
+	// of the run uses it without prompting.
+	if *tokenArg != "" {
+		name, err := validateWebexToken(*tokenArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WEBEX_TOKEN_EXPIRED: supplied token is invalid: %v\n", err)
+			os.Exit(2)
+		}
+		if err := saveUserToken(*tokenArg); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not save token to disk: %v\n", err)
+		}
+		os.Setenv("WEBEX_TOKEN", *tokenArg)
+		fmt.Printf("Webex token accepted — signed in as %s.\n", name)
 	}
 
 	// Authenticate with Webex before anything else: validate or obtain a
