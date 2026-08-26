@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+// eastern is America/New_York, used for all display-facing time formatting.
+// Falls back to UTC-5 (EST) if the timezone database is unavailable.
+var eastern = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.FixedZone("EST", -5*60*60)
+	}
+	return loc
+}()
+
 const localManifestFile = ".wts-manifest.json"
 
 // localEntry records a single locally-saved transcript.
@@ -81,12 +91,13 @@ func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
 		return "", fmt.Errorf("creating output directory: %w", err)
 	}
 
-	dateStr := t.StartTime.Format("2006-01-02")
+	startET := t.StartTime.In(eastern)
+	dateStr := startET.Format("2006-01-02")
 	transcriptPath := filepath.Join(dir, dateStr+"-transcript.md")
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# %s\n\n", t.MeetingTitle)
-	fmt.Fprintf(&sb, "**Date:** %s\n", t.StartTime.Format("January 2, 2006 15:04 MST"))
+	fmt.Fprintf(&sb, "**Date:** %s\n", startET.Format("January 2, 2006 15:04 MST"))
 	if t.SpaceName != "" {
 		fmt.Fprintf(&sb, "**Space:** %s\n", t.SpaceName)
 	}
@@ -112,7 +123,7 @@ func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
 		summaryPath := filepath.Join(dir, dateStr+"-summary.md")
 		var ss strings.Builder
 		fmt.Fprintf(&ss, "# %s — Summary\n\n", t.MeetingTitle)
-		fmt.Fprintf(&ss, "**Date:** %s\n\n", t.StartTime.Format("January 2, 2006"))
+		fmt.Fprintf(&ss, "**Date:** %s\n\n", t.StartTime.In(eastern).Format("January 2, 2006"))
 		ss.WriteString("---\n\n")
 		ss.WriteString(t.AISummary)
 		if err := os.WriteFile(summaryPath, []byte(ss.String()), 0644); err != nil {
@@ -190,7 +201,7 @@ func upsertCalendarJSON(calendarDir string, meetings []ScheduledMeeting) (string
 	cf.Meetings = make(map[string][]CalendarEntry)
 	for _, entry := range all {
 		t, _ := time.Parse(time.RFC3339, entry.Start)
-		dateKey := t.Local().Format("2006-01-02")
+		dateKey := t.In(eastern).Format("2006-01-02")
 		cf.Meetings[dateKey] = append(cf.Meetings[dateKey], entry)
 	}
 
