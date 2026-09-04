@@ -947,7 +947,7 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 
 	// Print a clear pre-flight summary.
 	if spaceID != "" {
-		fmt.Printf("\n[Space-linked meeting] All members of %q will be included.\n", resolvedSpaceName)
+		fmt.Printf("\n[Space-linked meeting] All members of %q (id: %s) will be included.\n", resolvedSpaceName, spaceID)
 		if len(invitees) > 0 {
 			fmt.Printf("  + %d extra invitee(s) outside the space: %s\n", len(invitees), strings.Join(invitees, ", "))
 		}
@@ -967,7 +967,7 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 	}
 
 	if spaceID != "" {
-		fmt.Printf("\nMeeting created! [space-linked → %q]\n", resolvedSpaceName)
+		fmt.Printf("\nMeeting created! [space-linked → %q (id: %s)]\n", resolvedSpaceName, spaceID)
 	} else {
 		fmt.Println("\nMeeting created! [standalone]")
 	}
