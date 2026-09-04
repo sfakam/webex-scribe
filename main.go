@@ -112,8 +112,13 @@ func main() {
 	outputDir := flag.String("output-dir", "", "Output directory for --local and --calendar modes (default: ~/webex-scribe-home)")
 	mySchedule := flag.Int("calendar", 0, "Write a local markdown agenda: positive N = next N days, negative N = past N days (e.g. --calendar 7, --calendar -7)")
 	tokenArg   := flag.String("token", "", "Webex Personal Access Token — validated, saved to disk, and used for this run (skips interactive prompt)")
-	sendMsg    := flag.String("send-message", "", "Send a message to a Webex Space as yourself. Supports markdown. Use '-' to read from stdin.")
-	spaceName  := flag.String("space-name", "", "Space name to send to (for --send-message); resolved to an ID via the API. Use --space-id for an exact ID.")
+	sendMsg          := flag.String("send-message", "", "Send a message to a Webex Space as yourself. Supports markdown. Use '-' to read from stdin.")
+	spaceName        := flag.String("space-name", "", "Webex Space name — resolved to an ID via the API (for --send-message and --schedule-meeting). Use --space-id for an exact ID.")
+	scheduleTitle    := flag.String("schedule-meeting", "", "Schedule a new Webex meeting. Value is the meeting title.")
+	meetingStart     := flag.String("start", "", "Meeting start time in RFC3339 format, e.g. 2026-09-08T14:00:00-04:00")
+	meetingDuration  := flag.Int("duration", 60, "Meeting duration in minutes (default 60)")
+	meetingAgenda    := flag.String("agenda", "", "Meeting agenda text")
+	meetingInvitees  := flag.String("invitees", "", "Comma-separated email addresses to invite (combined with --space members when --space-name/--space-id is set)")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
@@ -239,6 +244,12 @@ func main() {
 	// Send-message mode: post a message to a Webex Space as the authenticated user.
 	if *sendMsg != "" {
 		runSendMessageMode(ctx, *clientID, *clientSecret, *sendMsg, *spaceID, *spaceName)
+		return
+	}
+
+	// Schedule-meeting mode: create a new Webex meeting, optionally inviting all members of a space.
+	if *scheduleTitle != "" {
+		runScheduleMeetingMode(ctx, *clientID, *clientSecret, *scheduleTitle, *meetingStart, *meetingDuration, *meetingAgenda, *meetingInvitees, *spaceID, *spaceName)
 		return
 	}
 
@@ -869,6 +880,107 @@ func runBotMode(ctx context.Context, clients *googleClients, from, to string) {
 	}
 
 	fmt.Printf("\nBot mode done! Uploaded: %d  Skipped: %d\n", totalUploaded, totalSkipped)
+}
+
+// runScheduleMeetingMode creates a new Webex meeting. When spaceID or spaceName
+// is provided, all members of that space are fetched and merged into the
+// invitee list (deduped by email). Explicit --invitees are also merged.
+func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, startStr string, durationMin int, agenda, inviteesStr, spaceID, spaceName string) {
+	if startStr == "" {
+		fmt.Fprintln(os.Stderr, "error: --schedule-meeting requires --start (e.g. 2026-09-08T14:00:00-04:00)")
+		os.Exit(1)
+	}
+
+	// Parse start time — try RFC3339 first, then local-timezone variants.
+	var start time.Time
+	var parseErr error
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04"} {
+		start, parseErr = time.ParseInLocation(layout, startStr, time.Local)
+		if parseErr == nil {
+			break
+		}
+	}
+	if parseErr != nil {
+		fmt.Fprintf(os.Stderr, "error: could not parse --start %q — use RFC3339, e.g. 2026-09-08T14:00:00-04:00\n", startStr)
+		os.Exit(1)
+	}
+	end := start.Add(time.Duration(durationMin) * time.Minute)
+
+	webexClient, err := newWebexClient(ctx, clientID, clientSecret, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Resolve space if given, then fetch its members.
+	seen := make(map[string]bool) // lowercase email → already added
+	var invitees []string
+
+	if spaceID == "" && spaceName != "" {
+		fmt.Printf("Looking up space %q...\n", spaceName)
+		info, err := webexClient.findRoomByName(spaceName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		spaceID = info.ID
+		fmt.Printf("Resolved: %q (type: %s, id: %s)\n", info.Title, info.Type, info.ID)
+	}
+	if spaceID != "" {
+		fmt.Printf("Fetching members of space %s...\n", spaceID)
+		members, err := webexClient.fetchRoomMembers(spaceID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not fetch space members: %v\n", err)
+		} else {
+			for _, m := range members {
+				if m.Email == "" {
+					continue
+				}
+				key := strings.ToLower(m.Email)
+				if !seen[key] {
+					seen[key] = true
+					invitees = append(invitees, m.Email)
+				}
+			}
+			fmt.Printf("  %d space member(s) added as invitees.\n", len(invitees))
+		}
+	}
+
+	// Merge explicit --invitees.
+	if inviteesStr != "" {
+		var extra int
+		for _, e := range strings.Split(inviteesStr, ",") {
+			e = strings.TrimSpace(e)
+			if e == "" {
+				continue
+			}
+			key := strings.ToLower(e)
+			if !seen[key] {
+				seen[key] = true
+				invitees = append(invitees, e)
+				extra++
+			}
+		}
+		if extra > 0 {
+			fmt.Printf("  %d additional explicit invitee(s) added.\n", extra)
+		}
+	}
+
+	fmt.Printf("\nScheduling %q\n  Start:    %s\n  End:      %s\n  Invitees: %d\n",
+		title, start.Format("2006-01-02 15:04 MST"), end.Format("2006-01-02 15:04 MST"), len(invitees))
+
+	result, err := webexClient.scheduleMeeting(title, agenda, start, end, invitees)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error creating meeting: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\nMeeting created!\n  Title:   %s\n  Start:   %s\n  End:     %s\n  Link:    %s\n  ID:      %s\n",
+		result.Title,
+		result.Start.Local().Format("2006-01-02 15:04 MST"),
+		result.End.Local().Format("2006-01-02 15:04 MST"),
+		result.WebLink,
+		result.ID,
+	)
 }
 
 // runSendMessageMode posts a single message to a Webex Space as the

@@ -35,7 +35,7 @@ const (
 	// by default because it must be explicitly enabled in the Webex app
 	// integration and requires admin privileges. Add it to the integration scopes
 	// on developer.webex.com and pass --admin to include it at runtime.
-	webexScope      = "meeting:schedules_read meeting:transcripts_read spark:rooms_read spark:memberships_read spark:messages_write"
+	webexScope      = "meeting:schedules_read meeting:schedules_write meeting:transcripts_read spark:rooms_read spark:memberships_read spark:messages_write"
 	webexAdminScope = "meeting:admin_transcript_read meeting:admin_summaries_read"
 	redirectURI = "http://localhost:47823/callback"
 )
@@ -1183,4 +1183,57 @@ func (c *WebexClient) findRoomByName(name string) (RoomInfo, error) {
 			name, len(matches), strings.Join(names, "\n"))
 	}
 	return RoomInfo{}, fmt.Errorf("no space found matching %q — check the name or use --space-id", name)
+}
+
+// MeetingResult holds key fields from a newly created Webex meeting.
+type MeetingResult struct {
+	ID      string
+	Title   string
+	Start   time.Time
+	End     time.Time
+	WebLink string
+}
+
+// scheduleMeeting creates a new Webex meeting and returns its details.
+// invitees is a list of email addresses; the host is added automatically by Webex.
+func (c *WebexClient) scheduleMeeting(title, agenda string, start, end time.Time, invitees []string) (MeetingResult, error) {
+	type inviteeEntry struct {
+		Email string `json:"email"`
+	}
+	invList := make([]inviteeEntry, len(invitees))
+	for i, e := range invitees {
+		invList[i] = inviteeEntry{Email: e}
+	}
+	payload, err := json.Marshal(map[string]any{
+		"title":    title,
+		"start":    start.UTC().Format(time.RFC3339),
+		"end":      end.UTC().Format(time.RFC3339),
+		"agenda":   agenda,
+		"invitees": invList,
+	})
+	if err != nil {
+		return MeetingResult{}, fmt.Errorf("encoding meeting payload: %w", err)
+	}
+	resp, err := c.httpClient.Post(webexAPIBase+"/meetings", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return MeetingResult{}, fmt.Errorf("creating meeting: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return MeetingResult{}, fmt.Errorf("meetings API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var raw struct {
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Start   string `json:"start"`
+		End     string `json:"end"`
+		WebLink string `json:"webLink"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return MeetingResult{}, fmt.Errorf("decoding meeting response: %w", err)
+	}
+	startT, _ := time.Parse(time.RFC3339, raw.Start)
+	endT, _ := time.Parse(time.RFC3339, raw.End)
+	return MeetingResult{ID: raw.ID, Title: raw.Title, Start: startT, End: endT, WebLink: raw.WebLink}, nil
 }
