@@ -119,6 +119,7 @@ func main() {
 	meetingDuration  := flag.Int("duration", 60, "Meeting duration in minutes (default 60)")
 	meetingAgenda    := flag.String("agenda", "", "Meeting agenda text")
 	meetingInvitees  := flag.String("invitees", "", "Comma-separated email addresses to invite (combined with --space members when --space-name/--space-id is set)")
+	notifySpace      := flag.Bool("notify-space", false, "After scheduling, post a meeting-info message to the space as yourself (requires --space-name or --space-id)")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
@@ -249,7 +250,7 @@ func main() {
 
 	// Schedule-meeting mode: create a new Webex meeting, optionally inviting all members of a space.
 	if *scheduleTitle != "" {
-		runScheduleMeetingMode(ctx, *clientID, *clientSecret, *scheduleTitle, *meetingStart, *meetingDuration, *meetingAgenda, *meetingInvitees, *spaceID, *spaceName)
+		runScheduleMeetingMode(ctx, *clientID, *clientSecret, *scheduleTitle, *meetingStart, *meetingDuration, *meetingAgenda, *meetingInvitees, *spaceID, *spaceName, *notifySpace)
 		return
 	}
 
@@ -887,7 +888,7 @@ func runBotMode(ctx context.Context, clients *googleClients, from, to string) {
 // space (roomId in the API payload) — it appears in the space's Meetings tab
 // and recordings/transcripts land there. Space members are implicitly included.
 // --invitees adds people outside the space.
-func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, startStr string, durationMin int, agenda, inviteesStr, spaceID, spaceName string) {
+func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, startStr string, durationMin int, agenda, inviteesStr, spaceID, spaceName string, notifySpace bool) {
 	if startStr == "" {
 		fmt.Fprintln(os.Stderr, "error: --schedule-meeting requires --start (e.g. 2026-09-08T14:00:00-04:00)")
 		os.Exit(1)
@@ -978,6 +979,56 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 		result.WebLink,
 		result.ID,
 	)
+
+	if notifySpace {
+		if spaceID == "" {
+			fmt.Fprintln(os.Stderr, "warning: --notify-space requires --space-name or --space-id — skipping notification")
+		} else {
+			msg := buildMeetingNotification(result.Title, result.WebLink, agenda, start, durationMin)
+			fmt.Printf("\nNotifying space %q...\n", resolvedSpaceName)
+			if err := webexClient.sendMessage(spaceID, msg); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not notify space: %v\n", err)
+			} else {
+				fmt.Println("Space notified.")
+			}
+		}
+	}
+}
+
+// buildMeetingNotification formats a meeting notification message showing the
+// meeting time across ET, Ireland, and India for distributed teams.
+func buildMeetingNotification(title, webLink, agenda string, start time.Time, durationMin int) string {
+	end := start.Add(time.Duration(durationMin) * time.Minute)
+
+	type tzEntry struct {
+		flag string
+		label string
+		loc   string
+	}
+	zones := []tzEntry{
+		{"🇺🇸", "ET (New York)", "America/New_York"},
+		{"🇮🇪", "Ireland (Dublin)", "Europe/Dublin"},
+		{"🇮🇳", "India (Kolkata)", "Asia/Kolkata"},
+	}
+
+	msg := fmt.Sprintf("📅 **Meeting Scheduled: %s**\n\n**When:** %s\n",
+		title, start.UTC().Format("Mon Jan 2, 2006"))
+
+	for _, z := range zones {
+		loc, err := time.LoadLocation(z.loc)
+		if err != nil {
+			continue
+		}
+		s := start.In(loc)
+		e := end.In(loc)
+		msg += fmt.Sprintf("%s %s: %s – %s\n", z.flag, z.label, s.Format("3:04 PM MST"), e.Format("3:04 PM MST"))
+	}
+
+	msg += fmt.Sprintf("\n🔗 [Join Meeting](%s)", webLink)
+	if agenda != "" {
+		msg += fmt.Sprintf("\n📋 **Agenda:** %s", agenda)
+	}
+	return msg
 }
 
 // runSendMessageMode posts a single message to a Webex Space as the
