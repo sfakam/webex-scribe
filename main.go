@@ -914,7 +914,8 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 		os.Exit(1)
 	}
 
-	// Resolve space name to ID when needed.
+	// Resolve space name to ID when needed; keep the display name for output.
+	resolvedSpaceName := spaceName
 	if spaceID == "" && spaceName != "" {
 		fmt.Printf("Looking up space %q...\n", spaceName)
 		info, err := webexClient.findRoomByName(spaceName)
@@ -923,8 +924,8 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 			os.Exit(1)
 		}
 		spaceID = info.ID
+		resolvedSpaceName = info.Title
 		fmt.Printf("Resolved: %q (type: %s, id: %s)\n", info.Title, info.Type, info.ID)
-		fmt.Println("  Space-linked meeting: members are implicitly included.")
 	}
 
 	// Parse explicit --invitees (extra people outside the space, if any).
@@ -942,22 +943,35 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 				invitees = append(invitees, e)
 			}
 		}
-		fmt.Printf("  %d explicit invitee(s) outside the space.\n", len(invitees))
 	}
 
-	spaceLabel := "none (standalone meeting)"
+	// Print a clear pre-flight summary.
 	if spaceID != "" {
-		spaceLabel = spaceID
+		fmt.Printf("\n[Space-linked meeting] All members of %q will be included.\n", resolvedSpaceName)
+		if len(invitees) > 0 {
+			fmt.Printf("  + %d extra invitee(s) outside the space: %s\n", len(invitees), strings.Join(invitees, ", "))
+		}
+	} else {
+		fmt.Println("\n[Standalone meeting] Not linked to any space.")
+		if len(invitees) > 0 {
+			fmt.Printf("  Invitees (%d): %s\n", len(invitees), strings.Join(invitees, ", "))
+		}
 	}
-	fmt.Printf("\nScheduling %q\n  Start:  %s\n  End:    %s\n  Space:  %s\n",
-		title, start.Format("2006-01-02 15:04 MST"), end.Format("2006-01-02 15:04 MST"), spaceLabel)
+	fmt.Printf("  Title:  %s\n  Start:  %s\n  End:    %s\n",
+		title, start.Format("2006-01-02 15:04 MST"), end.Format("2006-01-02 15:04 MST"))
 
 	result, err := webexClient.scheduleMeeting(title, agenda, spaceID, start, end, invitees)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error creating meeting: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("\nMeeting created!\n  Title:  %s\n  Start:  %s\n  End:    %s\n  Link:   %s\n  ID:     %s\n",
+
+	if spaceID != "" {
+		fmt.Printf("\nMeeting created! [space-linked → %q]\n", resolvedSpaceName)
+	} else {
+		fmt.Println("\nMeeting created! [standalone]")
+	}
+	fmt.Printf("  Title:  %s\n  Start:  %s\n  End:    %s\n  Link:   %s\n  ID:     %s\n",
 		result.Title,
 		result.Start.Local().Format("2006-01-02 15:04 MST"),
 		result.End.Local().Format("2006-01-02 15:04 MST"),
