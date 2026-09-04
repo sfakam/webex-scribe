@@ -984,7 +984,7 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 		if spaceID == "" {
 			fmt.Fprintln(os.Stderr, "warning: --notify-space requires --space-name or --space-id — skipping notification")
 		} else {
-			msg := buildMeetingNotification(result.Title, result.WebLink, agenda, start, durationMin)
+			msg := buildMeetingNotification(result.Title, agenda, start, durationMin)
 			fmt.Printf("\nNotifying space %q...\n", resolvedSpaceName)
 			if err := webexClient.sendMessage(spaceID, msg); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not notify space: %v\n", err)
@@ -997,7 +997,7 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 
 // buildMeetingNotification formats a meeting notification message showing the
 // meeting time across ET, Ireland, and India for distributed teams.
-func buildMeetingNotification(title, webLink, agenda string, start time.Time, durationMin int) string {
+func buildMeetingNotification(title, agenda string, start time.Time, durationMin int) string {
 	end := start.Add(time.Duration(durationMin) * time.Minute)
 
 	type tzEntry struct {
@@ -1024,7 +1024,6 @@ func buildMeetingNotification(title, webLink, agenda string, start time.Time, du
 		msg += fmt.Sprintf("%s %s: %s – %s\n", z.flag, z.label, s.Format("3:04 PM MST"), e.Format("3:04 PM MST"))
 	}
 
-	msg += fmt.Sprintf("\n🔗 [Join Meeting](%s)", webLink)
 	if agenda != "" {
 		msg += fmt.Sprintf("\n📋 **Agenda:** %s", agenda)
 	}
