@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -110,7 +111,9 @@ func main() {
 	local     := flag.Bool("local", false, "Save transcripts to local markdown files instead of uploading to Google Docs (skips Google auth)")
 	outputDir := flag.String("output-dir", "", "Output directory for --local and --calendar modes (default: ~/webex-scribe-home)")
 	mySchedule := flag.Int("calendar", 0, "Write a local markdown agenda: positive N = next N days, negative N = past N days (e.g. --calendar 7, --calendar -7)")
-	tokenArg  := flag.String("token", "", "Webex Personal Access Token — validated, saved to disk, and used for this run (skips interactive prompt)")
+	tokenArg   := flag.String("token", "", "Webex Personal Access Token — validated, saved to disk, and used for this run (skips interactive prompt)")
+	sendMsg    := flag.String("send-message", "", "Send a message to a Webex Space as yourself. Supports markdown. Use '-' to read from stdin.")
+	spaceName  := flag.String("space-name", "", "Space name to send to (for --send-message); resolved to an ID via the API. Use --space-id for an exact ID.")
 
 	// Advanced flags hidden from default --help output.
 	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
@@ -230,6 +233,12 @@ func main() {
 	// agenda. Positive N = next N days; negative N = past N days.
 	if *mySchedule != 0 {
 		runScheduleMode(ctx, *clientID, *clientSecret, *admin, *mySchedule, *outputDir)
+		return
+	}
+
+	// Send-message mode: post a message to a Webex Space as the authenticated user.
+	if *sendMsg != "" {
+		runSendMessageMode(ctx, *clientID, *clientSecret, *sendMsg, *spaceID, *spaceName)
 		return
 	}
 
@@ -658,16 +667,19 @@ func runScheduleMode(ctx context.Context, clientID, clientSecret string, adminMo
 		os.Exit(1)
 	}
 
-	now := time.Now().UTC()
+	now := time.Now()
 	var from, to time.Time
 	var direction string
 	if days > 0 {
-		from = now
-		to = now.Add(time.Duration(days) * 24 * time.Hour)
+		// Anchor to midnight today (local time) so meetings that started
+		// earlier today are included regardless of when the command runs.
+		y, m, d := now.Date()
+		from = time.Date(y, m, d, 0, 0, 0, 0, now.Location()).UTC()
+		to = from.Add(time.Duration(days) * 24 * time.Hour)
 		direction = fmt.Sprintf("next %d day(s)", days)
 	} else {
-		from = now.Add(time.Duration(days) * 24 * time.Hour) // days is negative
-		to = now
+		from = now.Add(time.Duration(days) * 24 * time.Hour).UTC() // days is negative
+		to = now.UTC()
 		direction = fmt.Sprintf("past %d day(s)", -days)
 	}
 	windowLabel := fmt.Sprintf("%s to %s", from.Format("2006-01-02"), to.Format("2006-01-02"))
@@ -857,4 +869,51 @@ func runBotMode(ctx context.Context, clients *googleClients, from, to string) {
 	}
 
 	fmt.Printf("\nBot mode done! Uploaded: %d  Skipped: %d\n", totalUploaded, totalSkipped)
+}
+
+// runSendMessageMode posts a single message to a Webex Space as the
+// authenticated user (not the bot). spaceID takes precedence over spaceName;
+// when spaceName is given, it is resolved to an ID via the rooms API.
+// Pass "-" as message to read the content from stdin.
+func runSendMessageMode(ctx context.Context, clientID, clientSecret, message, spaceID, spaceName string) {
+	if spaceID == "" && spaceName == "" {
+		fmt.Fprintln(os.Stderr, "error: --send-message requires --space-id or --space-name")
+		os.Exit(1)
+	}
+
+	if message == "-" {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
+			os.Exit(1)
+		}
+		message = strings.TrimRight(string(b), "\n")
+		if message == "" {
+			fmt.Fprintln(os.Stderr, "error: message from stdin is empty")
+			os.Exit(1)
+		}
+	}
+
+	webexClient, err := newWebexClient(ctx, clientID, clientSecret, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if spaceID == "" {
+		fmt.Printf("Looking up space %q...\n", spaceName)
+		info, err := webexClient.findRoomByName(spaceName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		spaceID = info.ID
+		fmt.Printf("Resolved: %q (type: %s, id: %s)\n", info.Title, info.Type, info.ID)
+	}
+
+	if err := webexClient.sendMessage(spaceID, message); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Message sent.")
 }

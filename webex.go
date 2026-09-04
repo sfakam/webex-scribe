@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,7 +35,7 @@ const (
 	// by default because it must be explicitly enabled in the Webex app
 	// integration and requires admin privileges. Add it to the integration scopes
 	// on developer.webex.com and pass --admin to include it at runtime.
-	webexScope      = "meeting:schedules_read meeting:transcripts_read spark:rooms_read spark:memberships_read"
+	webexScope      = "meeting:schedules_read meeting:transcripts_read spark:rooms_read spark:memberships_read spark:messages_write"
 	webexAdminScope = "meeting:admin_transcript_read meeting:admin_summaries_read"
 	redirectURI = "http://localhost:47823/callback"
 )
@@ -1128,4 +1129,58 @@ func listBotSpaces(client *WebexClient) ([]botSpace, error) {
 		apiURL = parseLinkNext(resp.Header.Get("Link"))
 	}
 	return all, nil
+}
+
+// sendMessage posts a message to a Webex Space as the authenticated user.
+// markdown supports Webex-flavoured markdown; plain text works fine too.
+func (c *WebexClient) sendMessage(roomID, markdown string) error {
+	payload, err := json.Marshal(map[string]string{
+		"roomId":   roomID,
+		"markdown": markdown,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding message payload: %w", err)
+	}
+	resp, err := c.httpClient.Post(webexAPIBase+"/messages", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("posting message: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("messages API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+// findRoomByName resolves a Webex Space by name.
+// Tries exact case-insensitive match first, then substring.
+// Returns an error listing all candidates when the substring match is ambiguous.
+func (c *WebexClient) findRoomByName(name string) (RoomInfo, error) {
+	rooms, err := c.fetchAllRooms()
+	if err != nil {
+		return RoomInfo{}, err
+	}
+	key := strings.ToLower(name)
+	if info, ok := rooms[key]; ok {
+		return info, nil
+	}
+	var matches []RoomInfo
+	for k, info := range rooms {
+		if strings.Contains(k, key) {
+			matches = append(matches, info)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		names := make([]string, len(matches))
+		for i, m := range matches {
+			names[i] = fmt.Sprintf("  %q (id: %s)", m.Title, m.ID)
+		}
+		return RoomInfo{}, fmt.Errorf("ambiguous space name %q — %d matches, use --space-id or be more specific:\n%s",
+			name, len(matches), strings.Join(names, "\n"))
+	}
+	return RoomInfo{}, fmt.Errorf("no space found matching %q — check the name or use --space-id", name)
 }
