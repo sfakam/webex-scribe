@@ -882,9 +882,11 @@ func runBotMode(ctx context.Context, clients *googleClients, from, to string) {
 	fmt.Printf("\nBot mode done! Uploaded: %d  Skipped: %d\n", totalUploaded, totalSkipped)
 }
 
-// runScheduleMeetingMode creates a new Webex meeting. When spaceID or spaceName
-// is provided, all members of that space are fetched and merged into the
-// invitee list (deduped by email). Explicit --invitees are also merged.
+// runScheduleMeetingMode creates a new Webex meeting.
+// When --space-name or --space-id is provided, the meeting is linked to that
+// space (roomId in the API payload) — it appears in the space's Meetings tab
+// and recordings/transcripts land there. Space members are implicitly included.
+// --invitees adds people outside the space.
 func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, startStr string, durationMin int, agenda, inviteesStr, spaceID, spaceName string) {
 	if startStr == "" {
 		fmt.Fprintln(os.Stderr, "error: --schedule-meeting requires --start (e.g. 2026-09-08T14:00:00-04:00)")
@@ -912,10 +914,7 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 		os.Exit(1)
 	}
 
-	// Resolve space if given, then fetch its members.
-	seen := make(map[string]bool) // lowercase email → already added
-	var invitees []string
-
+	// Resolve space name to ID when needed.
 	if spaceID == "" && spaceName != "" {
 		fmt.Printf("Looking up space %q...\n", spaceName)
 		info, err := webexClient.findRoomByName(spaceName)
@@ -925,30 +924,13 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 		}
 		spaceID = info.ID
 		fmt.Printf("Resolved: %q (type: %s, id: %s)\n", info.Title, info.Type, info.ID)
-	}
-	if spaceID != "" {
-		fmt.Printf("Fetching members of space %s...\n", spaceID)
-		members, err := webexClient.fetchRoomMembers(spaceID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not fetch space members: %v\n", err)
-		} else {
-			for _, m := range members {
-				if m.Email == "" {
-					continue
-				}
-				key := strings.ToLower(m.Email)
-				if !seen[key] {
-					seen[key] = true
-					invitees = append(invitees, m.Email)
-				}
-			}
-			fmt.Printf("  %d space member(s) added as invitees.\n", len(invitees))
-		}
+		fmt.Println("  Space-linked meeting: members are implicitly included.")
 	}
 
-	// Merge explicit --invitees.
+	// Parse explicit --invitees (extra people outside the space, if any).
+	seen := make(map[string]bool)
+	var invitees []string
 	if inviteesStr != "" {
-		var extra int
 		for _, e := range strings.Split(inviteesStr, ",") {
 			e = strings.TrimSpace(e)
 			if e == "" {
@@ -958,23 +940,24 @@ func runScheduleMeetingMode(ctx context.Context, clientID, clientSecret, title, 
 			if !seen[key] {
 				seen[key] = true
 				invitees = append(invitees, e)
-				extra++
 			}
 		}
-		if extra > 0 {
-			fmt.Printf("  %d additional explicit invitee(s) added.\n", extra)
-		}
+		fmt.Printf("  %d explicit invitee(s) outside the space.\n", len(invitees))
 	}
 
-	fmt.Printf("\nScheduling %q\n  Start:    %s\n  End:      %s\n  Invitees: %d\n",
-		title, start.Format("2006-01-02 15:04 MST"), end.Format("2006-01-02 15:04 MST"), len(invitees))
+	spaceLabel := "none (standalone meeting)"
+	if spaceID != "" {
+		spaceLabel = spaceID
+	}
+	fmt.Printf("\nScheduling %q\n  Start:  %s\n  End:    %s\n  Space:  %s\n",
+		title, start.Format("2006-01-02 15:04 MST"), end.Format("2006-01-02 15:04 MST"), spaceLabel)
 
-	result, err := webexClient.scheduleMeeting(title, agenda, start, end, invitees)
+	result, err := webexClient.scheduleMeeting(title, agenda, spaceID, start, end, invitees)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error creating meeting: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("\nMeeting created!\n  Title:   %s\n  Start:   %s\n  End:     %s\n  Link:    %s\n  ID:      %s\n",
+	fmt.Printf("\nMeeting created!\n  Title:  %s\n  Start:  %s\n  End:    %s\n  Link:   %s\n  ID:     %s\n",
 		result.Title,
 		result.Start.Local().Format("2006-01-02 15:04 MST"),
 		result.End.Local().Format("2006-01-02 15:04 MST"),

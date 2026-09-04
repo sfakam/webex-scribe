@@ -1195,8 +1195,10 @@ type MeetingResult struct {
 }
 
 // scheduleMeeting creates a new Webex meeting and returns its details.
-// invitees is a list of email addresses; the host is added automatically by Webex.
-func (c *WebexClient) scheduleMeeting(title, agenda string, start, end time.Time, invitees []string) (MeetingResult, error) {
+// When roomID is non-empty the meeting is linked to that Webex Space — it
+// appears in the space's Meetings tab and recordings/transcripts land there.
+// Space members are implicitly included; invitees is for people outside the space.
+func (c *WebexClient) scheduleMeeting(title, agenda, roomID string, start, end time.Time, invitees []string) (MeetingResult, error) {
 	type inviteeEntry struct {
 		Email string `json:"email"`
 	}
@@ -1204,13 +1206,17 @@ func (c *WebexClient) scheduleMeeting(title, agenda string, start, end time.Time
 	for i, e := range invitees {
 		invList[i] = inviteeEntry{Email: e}
 	}
-	payload, err := json.Marshal(map[string]any{
+	body := map[string]any{
 		"title":    title,
 		"start":    start.UTC().Format(time.RFC3339),
 		"end":      end.UTC().Format(time.RFC3339),
 		"agenda":   agenda,
 		"invitees": invList,
-	})
+	}
+	if roomID != "" {
+		body["roomId"] = roomID
+	}
+	payload, err := json.Marshal(body)
 	if err != nil {
 		return MeetingResult{}, fmt.Errorf("encoding meeting payload: %w", err)
 	}
