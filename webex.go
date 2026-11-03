@@ -59,11 +59,26 @@ type RoomInfo struct {
 	Type  string // "direct" or "group"
 }
 
-// MeetingDetails holds the room and scheduling type of a Webex meeting instance
-// returned by GET /meetings/{meetingId}.
+// MeetingDetails holds metadata for a Webex meeting instance returned by
+// GET /meetings/{meetingId}.
 type MeetingDetails struct {
-	RoomID        string `json:"roomId"`
-	ScheduledType string `json:"scheduledType"` // "personalRoomMeeting", "meeting", "webinar"
+	RoomID          string `json:"roomId"`
+	ScheduledType   string `json:"scheduledType"` // "personalRoomMeeting", "meeting", "webinar"
+	Title           string `json:"title"`
+	Start           string `json:"start"`           // RFC3339
+	End             string `json:"end"`             // RFC3339
+	HostDisplayName string `json:"hostDisplayName"`
+	HostEmail       string `json:"hostEmail"`
+	Agenda          string `json:"agenda"`
+}
+
+// MeetingParticipant represents a single attendee from GET /meetingParticipants.
+type MeetingParticipant struct {
+	DisplayName string `json:"displayName"`
+	Email       string `json:"email"`
+	JoinedAt    string `json:"joinedTime,omitempty"`  // RFC3339
+	LeftAt      string `json:"leftTime,omitempty"`   // RFC3339
+	IsHost      bool   `json:"isHost"`
 }
 
 // WebexClient wraps an authenticated HTTP client for the Webex REST API.
@@ -86,6 +101,11 @@ type WebexClient struct {
 	// meetingDetailsCache caches meetingId -> MeetingDetails (roomId + scheduledType).
 	meetingDetailsMu    sync.Mutex
 	meetingDetailsCache map[string]MeetingDetails
+
+	// currentUserEmail is the email of the authenticated user, populated lazily
+	// by CurrentUserEmail().
+	currentUserOnce  sync.Once
+	currentUserEmail string
 }
 
 // Transcript holds the metadata, raw VTT content, and optional AI summary of
@@ -102,14 +122,24 @@ type Transcript struct {
 	SpaceType string
 	// RoomID is the Webex Space roomId, used to fetch members.
 	RoomID    string
-	StartTime time.Time
-	Content   string
+	StartTime       time.Time
+	EndTime         time.Time // zero if unavailable
+	HostDisplayName string
+	HostEmail       string
+	Agenda          string
+	Content         string
 	// AISummary is the AI-generated meeting summary. It is empty when the
 	// meeting had no AI summary or when the summary API returned an error.
 	AISummary string
+	// Category classifies the meeting using the same rules as the
+	// /sf:meeting-notes skill: 1:1, recurring, or standalone.
+	Category MeetingCategory
 	// RoomMembers is the member list of the Webex Space. Empty for meetings
 	// not tied to a Space or when the memberships API returns an error.
 	RoomMembers []RoomMember
+	// Participants holds the actual attendees from GET /meetingParticipants.
+	// Empty when the API call fails or returns no data.
+	Participants []MeetingParticipant
 }
 
 // newWebexClient returns a WebexClient authenticated with the Webex API.
@@ -408,7 +438,7 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 	var transcripts []Transcript
 	for i, item := range items {
 		startTime, _ := time.Parse(time.RFC3339, item.StartTime)
-		fmt.Printf("  [%d/%d] downloading %s (%s)\n", i+1, len(items), item.MeetingTopic, startTime.Format("Jan 2, 2006"))
+		fmt.Printf("  [%d/%d] fetching (new) %s (%s)\n", i+1, len(items), item.MeetingTopic, startTime.Format("Jan 2, 2006"))
 		content, err := downloadTranscript(client, item.ID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "        warning: skipping — %v\n", err)
@@ -427,14 +457,20 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 		//  3. Title match against the user's room list (last resort).
 		var spaceName, spaceType, resolvedRoomID string
 		var members []RoomMember
+		var endTime time.Time
+		var hostDisplayName, hostEmail, agenda string
 
 		resolvedRoomID = item.RoomID
 		skipTitleMatch := false
 
 		if details, err := client.fetchMeetingDetails(item.MeetingID); err == nil {
+			hostDisplayName = details.HostDisplayName
+			hostEmail = details.HostEmail
+			agenda = details.Agenda
+			if t, err := time.Parse(time.RFC3339, details.End); err == nil {
+				endTime = t
+			}
 			if details.ScheduledType == "personalRoomMeeting" {
-				// Definitively a Personal Meeting Room — clear any roomId and
-				// skip title matching so it routes to personal-room.
 				resolvedRoomID = ""
 				skipTitleMatch = true
 			} else if details.RoomID != "" {
@@ -453,7 +489,6 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 				fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", resolvedRoomID, err)
 			}
 		} else if !skipTitleMatch {
-			// No roomId resolved and not a confirmed PMR — try title match.
 			if allRooms, err := client.fetchAllRooms(); err == nil {
 				key := strings.ToLower(item.MeetingTopic)
 				if matched, ok := allRooms[key]; ok {
@@ -472,17 +507,34 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 				fmt.Fprintf(os.Stderr, "        note: could not fetch room members — %v\n", err)
 			}
 		}
+
+		participants, err := client.fetchMeetingParticipants(item.MeetingID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "        note: could not fetch participants — %v\n", err)
+		}
+		if len(participants) == 0 {
+			participants = parseTranscriptSpeakers(content)
+			if len(participants) > 0 {
+				fmt.Fprintf(os.Stderr, "        note: participant API empty — extracted %d speakers from transcript\n", len(participants))
+			}
+		}
+
 		transcripts = append(transcripts, Transcript{
-			ID:           item.ID,
-			MeetingID:    item.MeetingID,
-			MeetingTitle: item.MeetingTopic,
-			SpaceName:    spaceName,
-			SpaceType:    spaceType,
-			RoomID:       resolvedRoomID,
-			StartTime:    startTime,
-			Content:      content,
-			AISummary:    summary,
-			RoomMembers:  members,
+			ID:              item.ID,
+			MeetingID:       item.MeetingID,
+			MeetingTitle:    item.MeetingTopic,
+			SpaceName:       spaceName,
+			SpaceType:       spaceType,
+			RoomID:          resolvedRoomID,
+			StartTime:       startTime,
+			EndTime:         endTime,
+			HostDisplayName: hostDisplayName,
+			HostEmail:       hostEmail,
+			Agenda:          agenda,
+			Content:         content,
+			AISummary:       summary,
+			RoomMembers:     members,
+			Participants:    participants,
 		})
 	}
 	return transcripts
@@ -521,6 +573,98 @@ func (c *WebexClient) fetchMeetingDetails(meetingID string) (MeetingDetails, err
 	c.meetingDetailsCache[meetingID] = d
 	c.meetingDetailsMu.Unlock()
 	return d, nil
+}
+
+// fetchMeetingParticipants returns the attendee list for meetingID from
+// GET /meetingParticipants. Returns nil (not an error) when the endpoint
+// returns no data or a non-200 status — participants are optional metadata.
+func (c *WebexClient) fetchMeetingParticipants(meetingID string) ([]MeetingParticipant, error) {
+	apiURL := fmt.Sprintf("%s/meetingParticipants?meetingId=%s&max=100", webexAPIBase, url.QueryEscape(meetingID))
+	var all []MeetingParticipant
+	for apiURL != "" {
+		resp, err := c.httpClient.Get(apiURL)
+		if err != nil {
+			return nil, fmt.Errorf("fetching participants for %s: %w", meetingID, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("meetingParticipants API returned %d for %s", resp.StatusCode, meetingID)
+		}
+		var result struct {
+			Items []struct {
+				DisplayName string `json:"displayName"`
+				Email       string `json:"email"`
+				JoinedTime  string `json:"joinedTime"`
+				LeftTime    string `json:"leftTime"`
+				Host        bool   `json:"host"`
+			} `json:"items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decoding participants for %s: %w", meetingID, err)
+		}
+		resp.Body.Close()
+		for _, item := range result.Items {
+			all = append(all, MeetingParticipant{
+				DisplayName: item.DisplayName,
+				Email:       item.Email,
+				JoinedAt:    item.JoinedTime,
+				LeftAt:      item.LeftTime,
+				IsHost:      item.Host,
+			})
+		}
+		apiURL = parseLinkNext(resp.Header.Get("Link"))
+	}
+	return all, nil
+}
+
+// vTagRe matches WebVTT voice tags: <v Speaker Name>
+var vTagRe = regexp.MustCompile(`<v ([^>]+)>`)
+
+// parseTranscriptSpeakers extracts unique speaker names from WebVTT transcript
+// content using <v Name> tags. Returns nil when no speakers are found.
+// Used as a fallback when the Webex /meetingParticipants API returns nothing.
+func parseTranscriptSpeakers(content string) []MeetingParticipant {
+	seen := make(map[string]struct{})
+	var out []MeetingParticipant
+	for _, m := range vTagRe.FindAllStringSubmatch(content, -1) {
+		name := strings.TrimSpace(m[1])
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, MeetingParticipant{DisplayName: name})
+	}
+	return out
+}
+
+// CurrentUserEmail returns the email address of the authenticated Webex user
+// via GET /people/me. The result is cached after the first call. Returns an
+// empty string on error so callers can treat it as a soft dependency.
+func (c *WebexClient) CurrentUserEmail() string {
+	c.currentUserOnce.Do(func() {
+		resp, err := c.httpClient.Get(webexAPIBase + "/people/me")
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		var me struct {
+			Emails []string `json:"emails"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
+			return
+		}
+		if len(me.Emails) > 0 {
+			c.currentUserEmail = strings.ToLower(me.Emails[0])
+		}
+	})
+	return c.currentUserEmail
 }
 
 // fetchRoomInfo resolves a Webex roomId to its title and type ("direct" or

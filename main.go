@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -231,7 +232,7 @@ func main() {
 
 	// Dry-run: authenticate Webex, list and resolve transcripts, print plan, exit.
 	if *dryRun {
-		runDryRun(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID)
+		runDryRun(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID, *outputDir)
 		return
 	}
 
@@ -257,7 +258,7 @@ func main() {
 	// Local transcript mode: download transcripts and save as markdown files.
 	// Skips Google auth entirely.
 	if *local {
-		runLocalTranscriptMode(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID, *outputDir)
+		runLocalTranscriptMode(ctx, *clientID, *clientSecret, *admin, *from, *to, *days, *spaceID, *outputDir, *reroute)
 		return
 	}
 
@@ -276,23 +277,23 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Ensuring Drive folder structure (%s/{personal-room,direct-rooms,shared-rooms}/<space>)...\n", rootFolderName)
+	fmt.Printf("Ensuring Drive folder structure (%s/{1-1s,recurring,standalone}/<space>)...\n", rootFolderName)
 	rootFolderID, err := ensureFolder(ctx, clients.drive, rootFolderName, "root")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	personalFolderID, err := ensureFolder(ctx, clients.drive, "personal-room", rootFolderID)
+	oneOnOneFolderID, err := ensureFolder(ctx, clients.drive, "1-1s", rootFolderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	directFolderID, err := ensureFolder(ctx, clients.drive, "direct-rooms", rootFolderID)
+	recurringFolderID, err := ensureFolder(ctx, clients.drive, "recurring", rootFolderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	sharedFolderID, err := ensureFolder(ctx, clients.drive, "shared-rooms", rootFolderID)
+	oneOffFolderID, err := ensureFolder(ctx, clients.drive, "standalone", rootFolderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -381,18 +382,70 @@ func main() {
 
 	if len(toDownload) == 0 {
 		fmt.Printf("\nAll %d transcript(s) already uploaded. Nothing to do.\n", skipped)
-		fmt.Printf("\n  personal-room:  %s\n", makeFolderURL(personalFolderID))
-		fmt.Printf("  direct-rooms:   %s\n", makeFolderURL(directFolderID))
-		fmt.Printf("  shared-rooms:   %s\n", makeFolderURL(sharedFolderID))
+		fmt.Printf("\n  1-1s:      %s\n", makeFolderURL(oneOnOneFolderID))
+		fmt.Printf("  recurring: %s\n", makeFolderURL(recurringFolderID))
+		fmt.Printf("  standalone:   %s\n", makeFolderURL(oneOffFolderID))
 		return
 	}
 
-	fmt.Printf("\nDownloading %d new transcript(s)...\n", len(toDownload))
+	fmt.Printf("\nFetching %d new transcript(s) from Webex (not previously uploaded)...\n", len(toDownload))
 	transcripts := downloadTranscriptItems(webexClient, toDownload)
 
 	if len(transcripts) == 0 {
 		fmt.Println("No transcripts could be downloaded.")
 		return
+	}
+
+	// Classify each transcript using the same rules as /sf:meeting-notes.
+	calendarDir := filepath.Join(*outputDir, "webex-calendar")
+	cf := loadCalendarFile(calendarDir)
+	currentUserEmail := webexClient.CurrentUserEmail()
+	for i := range transcripts {
+		transcripts[i].Category = classifyMeeting(transcripts[i].MeetingTitle, cf, transcripts[i].Participants, currentUserEmail, transcripts[i].SpaceType)
+		fmt.Printf("  [classify] %s → %s\n", transcripts[i].MeetingTitle, transcripts[i].Category)
+	}
+
+	// Merge downloaded meetings into webex-calendar.json so every run keeps
+	// the calendar up to date, not just --calendar runs.
+	if _, err := upsertCalendarJSON(calendarDir, transcriptsToScheduledMeetings(transcripts)); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not update webex-calendar.json: %v\n", err)
+	}
+
+	// Write transcripts to local disk first (same layout as --local mode).
+	// This keeps a local cache regardless of upload outcome and ensures both
+	// modes produce identical file trees under outputDir.
+	fmt.Printf("\nSaving %d transcript(s) locally to %s...\n", len(transcripts), *outputDir)
+	localMf := loadLocalManifest(*outputDir)
+	for _, t := range transcripts {
+		path, err := writeTranscriptLocally(*outputDir, t)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not save %q locally: %v\n", t.MeetingTitle, err)
+			continue
+		}
+		infoPath := strings.TrimSuffix(path, "transcript.md") + "meeting-info.json"
+		entry := localEntry{
+			Title:           t.MeetingTitle,
+			Category:        t.Category.String(),
+			MeetingID:       t.MeetingID,
+			MeetingDate:     t.StartTime.In(eastern).Format("2006-01-02"),
+			StartTime:       t.StartTime.UTC().Format(time.RFC3339),
+			HostDisplayName: t.HostDisplayName,
+			HostEmail:       t.HostEmail,
+			SpaceName:       t.SpaceName,
+			Participants:    deduplicateParticipants(t.Participants),
+			TranscriptPath:  path,
+			WrittenAt:       time.Now().UTC(),
+		}
+		if !t.EndTime.IsZero() {
+			entry.EndTime = t.EndTime.UTC().Format(time.RFC3339)
+			entry.DurationMinutes = int(t.EndTime.Sub(t.StartTime).Minutes())
+		}
+		if _, err := os.Stat(infoPath); err == nil {
+			entry.InfoPath = infoPath
+		}
+		if err := localMf.record(t.ID, entry); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: local manifest update failed for %q: %v\n", t.MeetingTitle, err)
+		}
 	}
 
 	total := len(transcripts)
@@ -425,13 +478,13 @@ func main() {
 				//   SpaceType == "" but     → shared-rooms   (room name lookup failed, but space exists)
 				//     RoomID is set
 				var targetFolderID string
-				switch {
-				case t.RoomID == "":
-					targetFolderID = personalFolderID
-				case t.SpaceType == "direct":
-					targetFolderID = directFolderID
-				default: // "group", unknown type, or lookup failed but RoomID is set
-					targetFolderID = sharedFolderID
+				switch t.Category {
+				case Category1on1:
+					targetFolderID = oneOnOneFolderID
+				case CategoryRecurring:
+					targetFolderID = recurringFolderID
+				default:
+					targetFolderID = oneOffFolderID
 				}
 				tURL, sURL, err := createMeetingDocs(ctx, clients, targetFolderID, t)
 				results <- uploadResult{t: t, transcriptURL: tURL, summaryURL: sURL, duration: time.Since(t0), err: err}
@@ -490,8 +543,8 @@ func main() {
 		if err := mf.record(ctx, r.t, r.transcriptURL, r.summaryURL); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: could not update manifest for %q: %v\n", r.t.MeetingTitle, err)
 		}
-		fmt.Printf("  [done] %s (%s) — %s\n    transcript: %s\n",
-			r.t.MeetingTitle, r.t.StartTime.Format("Jan 2, 2006"),
+		fmt.Printf("  [done] [%s] %s (%s) — %s\n    transcript: %s\n",
+			r.t.Category, r.t.MeetingTitle, r.t.StartTime.Format("Jan 2, 2006"),
 			r.duration.Round(time.Millisecond), r.transcriptURL)
 		if r.summaryURL != "" {
 			fmt.Printf("    summary:    %s\n", r.summaryURL)
@@ -501,9 +554,9 @@ func main() {
 
 	fmt.Printf("\nDone! Uploaded: %d  Skipped (already uploaded): %d  Total time: %s\n",
 		uploaded, skipped, time.Since(uploadStart).Round(time.Second))
-	fmt.Printf("\n  personal-room:  %s\n", makeFolderURL(personalFolderID))
-	fmt.Printf("  direct-rooms:   %s\n", makeFolderURL(directFolderID))
-	fmt.Printf("  shared-rooms:   %s\n", makeFolderURL(sharedFolderID))
+	fmt.Printf("\n  1-1s:      %s\n", makeFolderURL(oneOnOneFolderID))
+	fmt.Printf("  recurring: %s\n", makeFolderURL(recurringFolderID))
+	fmt.Printf("  standalone:   %s\n", makeFolderURL(oneOffFolderID))
 
 	// Bot mode: after the personal sync, also run the bot space sweep if
 	// --bot was requested.
@@ -516,7 +569,7 @@ func main() {
 // lists all transcripts in the requested window, resolves the target folder for
 // each via the meetings API, and prints an upload/skip plan without writing
 // anything to Drive or downloading any transcript content.
-func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, from, to string, days int, spaceID string) {
+func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, from, to string, days int, spaceID, outputDir string) {
 	fmt.Println("Authenticating with Google (dry-run)...")
 	clients, err := newGoogleClients(ctx)
 	if err != nil {
@@ -565,6 +618,8 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 		fmt.Println("No transcripts found for the specified date range.")
 		return
 	}
+
+	dryRunCF := loadCalendarFile(filepath.Join(outputDir, "webex-calendar"))
 
 	fmt.Printf("\nDry run — %d transcript(s) found:\n\n", len(allItems))
 	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %-12s  %-24s  %s\n",
@@ -636,24 +691,13 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 			}
 		}
 
-		var category, subFolder string
-		switch {
-		case resolvedRoomID == "":
-			category = "personal-room"
-			subFolder = item.MeetingTopic
-		case spaceType == "direct":
-			category = "direct-rooms"
+		cat := classifyMeeting(item.MeetingTopic, dryRunCF, nil, "", spaceType)
+		subFolder := item.MeetingTopic
+		if spaceName != "" {
 			subFolder = spaceName
-		default:
-			category = "shared-rooms"
-			if spaceName != "" {
-				subFolder = spaceName
-			} else {
-				subFolder = item.MeetingTopic
-			}
 		}
 
-		folderPath := fmt.Sprintf("%s/%s/%s", rootFolderName, category, subFolder)
+		folderPath := fmt.Sprintf("%s/%s/%s", rootFolderName, cat.DriveFolder(), subFolder)
 		titleTrunc := item.MeetingTopic
 		if len(titleTrunc) > 35 {
 			titleTrunc = titleTrunc[:32] + "..."
@@ -716,7 +760,7 @@ func runScheduleMode(ctx context.Context, clientID, clientSecret string, adminMo
 // runLocalTranscriptMode downloads transcripts for the requested window and
 // saves them as markdown files to outputDir. Deduplication uses a local JSON
 // manifest (.wts-manifest.json) inside outputDir. Google auth is not required.
-func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, adminMode bool, from, to string, days int, spaceID, outputDir string) {
+func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, adminMode bool, from, to string, days int, spaceID, outputDir string, reroute bool) {
 	fmt.Println("Authenticating with Webex...")
 	webexClient, err := newWebexClient(ctx, clientID, clientSecret, adminMode)
 	if err != nil {
@@ -755,7 +799,7 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 	var toDownload []transcriptItem
 	var skipped int
 	for _, item := range allItems {
-		if lm.known(item.ID) {
+		if !reroute && lm.known(item.ID) {
 			t, _ := time.Parse(time.RFC3339, item.StartTime)
 			fmt.Printf("  [skip] %s (%s) — already saved\n", item.MeetingTopic, t.Format("Jan 2, 2006"))
 			skipped++
@@ -770,8 +814,26 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 		return
 	}
 
-	fmt.Printf("\nDownloading %d new transcript(s)...\n", len(toDownload))
+	rerouteNote := ""
+	if reroute {
+		rerouteNote = " (--reroute: re-fetching all)"
+	}
+	fmt.Printf("\nFetching %d new transcript(s) from Webex (not previously saved)%s...\n", len(toDownload), rerouteNote)
 	transcripts := downloadTranscriptItems(webexClient, toDownload)
+
+	// Classify each transcript using the same rules as /sf:meeting-notes.
+	localCalendarDir := filepath.Join(outputDir, "webex-calendar")
+	localCF := loadCalendarFile(localCalendarDir)
+	localUserEmail := webexClient.CurrentUserEmail()
+	for i := range transcripts {
+		transcripts[i].Category = classifyMeeting(transcripts[i].MeetingTitle, localCF, transcripts[i].Participants, localUserEmail, transcripts[i].SpaceType)
+		fmt.Printf("  [classify] %s → %s\n", transcripts[i].MeetingTitle, transcripts[i].Category)
+	}
+
+	// Merge downloaded meetings into webex-calendar.json.
+	if _, err := upsertCalendarJSON(localCalendarDir, transcriptsToScheduledMeetings(transcripts)); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not update webex-calendar.json: %v\n", err)
+	}
 
 	var saved int
 	for _, t := range transcripts {
@@ -780,15 +842,31 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 			fmt.Fprintf(os.Stderr, "  [error] %s: %v\n", t.MeetingTitle, err)
 			continue
 		}
-		if err := lm.record(t.ID, localEntry{
-			Title:       t.MeetingTitle,
-			MeetingDate: t.StartTime.UTC().Format("2006-01-02"),
-			Path:        path,
-			WrittenAt:   time.Now().UTC(),
-		}); err != nil {
+		infoPath := strings.TrimSuffix(path, "transcript.md") + "meeting-info.json"
+		entry := localEntry{
+			Title:           t.MeetingTitle,
+			Category:        t.Category.String(),
+			MeetingID:       t.MeetingID,
+			MeetingDate:     t.StartTime.In(eastern).Format("2006-01-02"),
+			StartTime:       t.StartTime.UTC().Format(time.RFC3339),
+			HostDisplayName: t.HostDisplayName,
+			HostEmail:       t.HostEmail,
+			SpaceName:       t.SpaceName,
+			Participants:    deduplicateParticipants(t.Participants),
+			TranscriptPath:  path,
+			WrittenAt:       time.Now().UTC(),
+		}
+		if !t.EndTime.IsZero() {
+			entry.EndTime = t.EndTime.UTC().Format(time.RFC3339)
+			entry.DurationMinutes = int(t.EndTime.Sub(t.StartTime).Minutes())
+		}
+		if _, err := os.Stat(infoPath); err == nil {
+			entry.InfoPath = infoPath
+		}
+		if err := lm.record(t.ID, entry); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: manifest update failed for %q: %v\n", t.MeetingTitle, err)
 		}
-		fmt.Printf("  [saved] %s (%s)\n    %s\n", t.MeetingTitle, t.StartTime.Format("Jan 2, 2006"), path)
+		fmt.Printf("  [saved] [%s] %s (%s)\n    %s\n", t.Category, t.MeetingTitle, t.StartTime.Format("Jan 2, 2006"), path)
 		saved++
 	}
 

@@ -14,6 +14,155 @@ import (
 	"time"
 )
 
+// MeetingCategory classifies a meeting using the same rules as the
+// /sf:meeting-notes skill.
+type MeetingCategory int
+
+const (
+	CategoryOneOff    MeetingCategory = iota // standalone (one-time) meeting
+	CategoryRecurring                        // appears 2+ times in calendar
+	Category1on1                             // title contains 1:1 / 1-1 / one on one
+)
+
+func (c MeetingCategory) String() string {
+	switch c {
+	case Category1on1:
+		return "1:1"
+	case CategoryRecurring:
+		return "recurring"
+	default:
+		return "standalone"
+	}
+}
+
+// DriveFolder returns the Drive subfolder name for this category.
+func (c MeetingCategory) DriveFolder() string {
+	switch c {
+	case Category1on1:
+		return "1-1s"
+	case CategoryRecurring:
+		return "recurring"
+	default:
+		return "standalone"
+	}
+}
+
+// titleIs1on1 reports whether the meeting title contains the standard 1:1
+// keywords or the display name of any of the given participants.
+func titleIs1on1(title string, participants []MeetingParticipant) bool {
+	lower := strings.ToLower(title)
+	if strings.Contains(lower, "1:1") || strings.Contains(lower, "1-1") ||
+		strings.Contains(lower, "one on one") || strings.Contains(lower, "one-on-one") {
+		return true
+	}
+	// Match any name token (>2 chars) from any participant's display name.
+	for _, p := range participants {
+		for _, token := range strings.Fields(p.DisplayName) {
+			if len(token) > 2 && strings.Contains(lower, strings.ToLower(token)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// deduplicateParticipants returns a slice with one entry per unique email.
+// Webex logs each join/rejoin as a separate participant entry, so the same
+// person can appear multiple times. The first occurrence is kept.
+func deduplicateParticipants(participants []MeetingParticipant) []MeetingParticipant {
+	seen := make(map[string]struct{})
+	out := make([]MeetingParticipant, 0, len(participants))
+	for _, p := range participants {
+		key := strings.ToLower(p.Email)
+		if key == "" {
+			key = strings.ToLower(p.DisplayName)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// classifyMeeting applies the /sf:meeting-notes classification rules:
+//  1. spaceType == "direct" → 1:1 (Webex direct space is always a 1:1).
+//  2. Title contains 1:1/1-1/one-on-one keyword → 1:1 (unconditional).
+//  3. Exactly 2 unique participants (one is currentUserEmail) AND the other
+//     person's name appears in the title → 1:1.
+//  4. Title appears 2+ times in webex-calendar.json → recurring.
+//  5. Everything else → standalone.
+//
+// Participants are deduplicated by email before counting so that rejoins
+// (Webex logs each join as a separate entry) don't inflate the count.
+// participants, currentUserEmail, and spaceType are optional — pass nil/"" when unavailable.
+func classifyMeeting(title string, cf *calendarFile, participants []MeetingParticipant, currentUserEmail, spaceType string) MeetingCategory {
+	// Direct Webex space = definitively a 1:1.
+	if strings.EqualFold(spaceType, "direct") {
+		return Category1on1
+	}
+
+	// Title keywords are an unconditional signal — check before participant count.
+	lower := strings.ToLower(title)
+	if strings.Contains(lower, "1:1") || strings.Contains(lower, "1-1") ||
+		strings.Contains(lower, "one on one") || strings.Contains(lower, "one-on-one") {
+		return Category1on1
+	}
+
+	// Deduplicate participants by email (rejoins create duplicate entries).
+	unique := deduplicateParticipants(participants)
+
+	if len(unique) == 2 && currentUserEmail != "" {
+		// 2-person meeting: require current user is one, then check if the
+		// OTHER person's name appears in the title.
+		for _, p := range unique {
+			if strings.EqualFold(p.Email, currentUserEmail) {
+				var others []MeetingParticipant
+				for _, o := range unique {
+					if !strings.EqualFold(o.Email, currentUserEmail) {
+						others = append(others, o)
+					}
+				}
+				if titleIs1on1(title, others) {
+					return Category1on1
+				}
+				break
+			}
+		}
+	}
+	if cf != nil {
+		count := 0
+		for _, entries := range cf.Meetings {
+			for _, e := range entries {
+				if strings.EqualFold(e.Title, title) {
+					count++
+					if count >= 2 {
+						return CategoryRecurring
+					}
+				}
+			}
+		}
+	}
+	return CategoryOneOff
+}
+
+// loadCalendarFile reads webex-calendar.json from calendarDir.
+// Returns nil when the file is missing or unparseable — callers fall back to
+// keyword-only classification in that case.
+func loadCalendarFile(calendarDir string) *calendarFile {
+	path := filepath.Join(calendarDir, "webex-calendar.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cf calendarFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return nil
+	}
+	return &cf
+}
+
 // eastern is America/New_York, used for all display-facing time formatting.
 // Falls back to UTC-5 (EST) if the timezone database is unavailable.
 var eastern = func() *time.Location {
@@ -27,11 +176,23 @@ var eastern = func() *time.Location {
 const localManifestFile = ".wts-manifest.json"
 
 // localEntry records a single locally-saved transcript.
+// The map key is the transcript record ID (from /meetingTranscripts).
+// MeetingID is the parent Webex meeting ID for cross-referencing.
 type localEntry struct {
-	Title       string    `json:"title"`
-	MeetingDate string    `json:"meetingDate"`
-	Path        string    `json:"path"`
-	WrittenAt   time.Time `json:"writtenAt"`
+	Title           string               `json:"title"`
+	Category        string               `json:"category"`
+	MeetingID       string               `json:"meetingId"`
+	MeetingDate     string               `json:"meetingDate"`
+	StartTime       string               `json:"startTime"`       // RFC3339 UTC
+	EndTime         string               `json:"endTime"`         // RFC3339 UTC, omitted if zero
+	DurationMinutes int                  `json:"durationMinutes"` // 0 if end unknown
+	HostDisplayName string               `json:"hostDisplayName,omitempty"`
+	HostEmail       string               `json:"hostEmail,omitempty"`
+	SpaceName       string               `json:"spaceName,omitempty"`
+	Participants    []MeetingParticipant `json:"participants,omitempty"`
+	TranscriptPath  string               `json:"transcriptPath"`
+	InfoPath        string               `json:"infoPath,omitempty"`
+	WrittenAt       time.Time            `json:"writtenAt"`
 }
 
 // localManifest tracks which transcript IDs have been saved to disk so
@@ -76,9 +237,14 @@ func (lm *localManifest) record(id string, e localEntry) error {
 }
 
 // writeTranscriptLocally writes a Transcript to outputDir as markdown.
-// Layout: outputDir/<space-or-meeting-title>/<YYYY-MM-DD>-transcript.md
+// Layout: outputDir/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-transcript.md
 //
-//	outputDir/<space-or-meeting-title>/<YYYY-MM-DD>-summary.md (when present)
+//	outputDir/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-summary.md (when present)
+//
+// <category> is one of "1-1s", "recurring", or "standalone" derived from t.Category.
+// The start time (HHmm in ET, 24h) is always included in the filename so that
+// multiple meetings in the same space on the same day never collide.
+// t.Category must be set before calling; zero value routes to "standalone".
 //
 // Returns the path of the transcript file.
 func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
@@ -86,14 +252,16 @@ func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
 	if label == "" {
 		label = t.MeetingTitle
 	}
-	dir := filepath.Join(outputDir, sanitizeFilename(label))
+	dir := filepath.Join(outputDir, t.Category.DriveFolder(), sanitizeFilename(label))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("creating output directory: %w", err)
 	}
 
 	startET := t.StartTime.In(eastern)
 	dateStr := startET.Format("2006-01-02")
-	transcriptPath := filepath.Join(dir, dateStr+"-transcript.md")
+	timeStr := startET.Format("1504")
+
+	transcriptPath := filepath.Join(dir, dateStr+"-"+timeStr+"-transcript.md")
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# %s\n\n", t.MeetingTitle)
@@ -120,7 +288,7 @@ func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
 	}
 
 	if t.AISummary != "" {
-		summaryPath := filepath.Join(dir, dateStr+"-summary.md")
+		summaryPath := filepath.Join(dir, dateStr+"-"+timeStr+"-summary.md")
 		var ss strings.Builder
 		fmt.Fprintf(&ss, "# %s — Summary\n\n", t.MeetingTitle)
 		fmt.Fprintf(&ss, "**Date:** %s\n\n", t.StartTime.In(eastern).Format("January 2, 2006"))
@@ -131,10 +299,72 @@ func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
 		}
 	}
 
+	// Write meeting-info.json alongside the transcript.
+	infoPath := filepath.Join(dir, dateStr+"-"+timeStr+"-meeting-info.json")
+	if err := writeMeetingInfo(infoPath, t); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not write meeting-info.json: %v\n", err)
+	}
+
 	return transcriptPath, nil
 }
 
-// CalendarEntry is a single meeting stored in calendar.json.
+// meetingInfoJSON is the on-disk structure for <date>-<HHmm>-meeting-info.json.
+type meetingInfoJSON struct {
+	ID              string               `json:"id"`
+	MeetingID       string               `json:"meetingId"`
+	Title           string               `json:"title"`
+	Category        string               `json:"category"`
+	StartTime       string               `json:"startTime"`       // RFC3339 UTC
+	EndTime         string               `json:"endTime"`         // RFC3339 UTC, omitted if zero
+	DurationMinutes int                  `json:"durationMinutes"` // 0 if end time unknown
+	HostDisplayName string               `json:"hostDisplayName,omitempty"`
+	HostEmail       string               `json:"hostEmail,omitempty"`
+	Agenda          string               `json:"agenda,omitempty"`
+	SpaceName       string               `json:"spaceName,omitempty"`
+	SpaceType       string               `json:"spaceType,omitempty"`
+	Participants    []MeetingParticipant `json:"participants,omitempty"`
+	SpaceMembers    []spaceMember        `json:"spaceMembers,omitempty"`
+}
+
+type spaceMember struct {
+	DisplayName string `json:"displayName"`
+	Email       string `json:"email"`
+	IsHost      bool   `json:"isHost"`
+}
+
+func writeMeetingInfo(path string, t Transcript) error {
+	info := meetingInfoJSON{
+		ID:              t.ID,
+		MeetingID:       t.MeetingID,
+		Title:           t.MeetingTitle,
+		Category:        t.Category.String(),
+		StartTime:       t.StartTime.UTC().Format(time.RFC3339),
+		HostDisplayName: t.HostDisplayName,
+		HostEmail:       t.HostEmail,
+		Agenda:          t.Agenda,
+		SpaceName:       t.SpaceName,
+		SpaceType:       t.SpaceType,
+		Participants:    t.Participants,
+	}
+	if !t.EndTime.IsZero() {
+		info.EndTime = t.EndTime.UTC().Format(time.RFC3339)
+		info.DurationMinutes = int(t.EndTime.Sub(t.StartTime).Minutes())
+	}
+	for _, m := range t.RoomMembers {
+		info.SpaceMembers = append(info.SpaceMembers, spaceMember{
+			DisplayName: m.DisplayName,
+			Email:       m.Email,
+			IsHost:      m.IsModerator,
+		})
+	}
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// CalendarEntry is a single meeting stored in webex-calendar.json.
 type CalendarEntry struct {
 	ID              string `json:"id"`
 	Title           string `json:"title"`
@@ -154,7 +384,25 @@ type calendarFile struct {
 	Meetings    map[string][]CalendarEntry `json:"meetings"`
 }
 
-// upsertCalendarJSON merges meetings into calendarDir/calendar.json.
+// transcriptsToScheduledMeetings converts a slice of Transcripts to
+// ScheduledMeetings so they can be merged into webex-calendar.json.
+// MeetingID is used as the stable dedup key.
+func transcriptsToScheduledMeetings(transcripts []Transcript) []ScheduledMeeting {
+	meetings := make([]ScheduledMeeting, 0, len(transcripts))
+	for _, t := range transcripts {
+		meetings = append(meetings, ScheduledMeeting{
+			ID:              t.MeetingID,
+			Title:           t.MeetingTitle,
+			Start:           t.StartTime,
+			End:             t.EndTime,
+			Agenda:          t.Agenda,
+			HostDisplayName: t.HostDisplayName,
+		})
+	}
+	return meetings
+}
+
+// upsertCalendarJSON merges meetings into calendarDir/webex-calendar.json.
 // Existing entries with the same ID are updated; new ones are added.
 // Entries are grouped by local start date and sorted by start time within
 // each date, so repeated runs accumulate a rolling calendar rather than
@@ -163,13 +411,13 @@ func upsertCalendarJSON(calendarDir string, meetings []ScheduledMeeting) (string
 	if err := os.MkdirAll(calendarDir, 0755); err != nil {
 		return "", fmt.Errorf("creating calendar dir: %w", err)
 	}
-	path := filepath.Join(calendarDir, "calendar.json")
+	path := filepath.Join(calendarDir, "webex-calendar.json")
 
 	// Load existing file — missing is fine, corrupt logs a warning.
 	cf := calendarFile{Meetings: make(map[string][]CalendarEntry)}
 	if data, err := os.ReadFile(path); err == nil {
 		if parseErr := json.Unmarshal(data, &cf); parseErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not parse existing calendar.json (starting fresh): %v\n", parseErr)
+			fmt.Fprintf(os.Stderr, "warning: could not parse existing webex-calendar.json (starting fresh): %v\n", parseErr)
 			cf.Meetings = make(map[string][]CalendarEntry)
 		}
 	}
@@ -221,7 +469,7 @@ func upsertCalendarJSON(calendarDir string, meetings []ScheduledMeeting) (string
 		return "", fmt.Errorf("marshalling calendar: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
-		return "", fmt.Errorf("writing calendar.json: %w", err)
+		return "", fmt.Errorf("writing webex-calendar.json: %w", err)
 	}
 	return path, nil
 }

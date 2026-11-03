@@ -1,6 +1,8 @@
 # webex-scribe
 
-Downloads meeting transcripts and AI summaries from Webex and creates one Google Doc per meeting, organised in Google Drive under `webex-meetings/YYYY-MM/<meeting name>/`. Each meeting folder contains a **Transcript** doc and, when available, a **Summary** doc.
+Downloads meeting transcripts and AI summaries from Webex and creates one Google Doc per meeting, organised in Google Drive under `webex-meetings/{personal-room,direct-rooms,shared-rooms}/<space or meeting name>/`. Each meeting folder contains a **Transcript** doc and, when available, a **Summary** doc and a **Members** doc listing space participants.
+
+Beyond the Google Docs sync, webex-scribe can also run fully offline (`--local`, `--calendar`), send Webex messages as yourself (`--send-message`), and schedule new Webex meetings (`--schedule-meeting`).
 
 ## Getting Started
 
@@ -41,6 +43,13 @@ cd webex-scribe
 go build -o webex-scribe .
 ```
 
+Or with `make` (embeds a version string from `git describe` and installs to `/usr/local/bin`):
+
+```sh
+make build
+make install
+```
+
 **2. Authenticate with Google:**
 
 ```sh
@@ -75,8 +84,9 @@ On the **first run** (after setup):
   Token saved to /home/you/.webex-meeting-sync/.env
   Signed in as Your Name.
   ```
+  You can skip the prompt by passing the token directly: `./webex-scribe --token <paste here>`. It's validated, saved, and used for the current run.
 - The token is saved to `~/.webex-meeting-sync/.env` and reused on subsequent runs until it expires.
-- Google OAuth2 opens a browser tab for authorization (one-time).
+- Google OAuth2 opens a browser tab for authorization (one-time). Skipped entirely in `--local` and `--calendar` modes.
 
 On **subsequent runs** the app authenticates silently and goes straight to syncing.
 
@@ -92,27 +102,49 @@ Project `.env` values take precedence over `~/.webex-meeting-sync/.env`. Useful 
 
 ## Drive Folder Structure
 
+Meetings are routed into one of three top-level categories based on where the meeting happened, then grouped into a per-space (or per-meeting-series) subfolder:
+
 ```
 webex-meetings/
-  Team Weekly Sync/
-    Team Weekly Sync — Apr 15, 2026 — Transcript
-    Team Weekly Sync — Apr 15, 2026 — Summary
-    Team Weekly Sync — Apr 1, 2026 — Transcript
-    Team Weekly Sync — Apr 1, 2026 — Summary
-  1:1 with Manager/
-    1:1 with Manager — Apr 9, 2026 — Transcript
-    1:1 with Manager — Apr 9, 2026 — Summary
+  personal-room/
+    1:1 with Manager/
+      1:1 with Manager — Apr 9, 2026 — Transcript
+      1:1 with Manager — Apr 9, 2026 — Summary
+  direct-rooms/
+    Jane Doe/
+      Jane Doe — Apr 15, 2026 — Transcript
+  shared-rooms/
+    Team Weekly Sync/
+      Team Weekly Sync — Apr 15, 2026 — Transcript
+      Team Weekly Sync — Apr 15, 2026 — Summary
+      Team Weekly Sync — Apr 1, 2026 — Transcript
+      Team Weekly Sync — Apr 1, 2026 — Summary
+      Members
   ...
 ```
 
+Routing logic:
+
+| Meeting has... | Lands in |
+|---|---|
+| No Webex Space (Personal Meeting Room, or a scheduled meeting not linked to a space) | `personal-room/` |
+| A Space of type `direct` (1:1) | `direct-rooms/` |
+| A Space of type `group` (team space) | `shared-rooms/` |
+
+A **Members** doc is created once per space folder (not recreated on later runs) listing all space participants, with moderators flagged.
+
+`--bot` mode uploads into a separate `webex-meetings-bot/` root using the same per-space folder convention, without the personal/direct/shared split.
+
 ## Deduplication
 
-A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive folder. On every run the app checks the manifest before downloading — transcripts already uploaded are skipped automatically. The manifest is shared across machines via Drive.
+A manifest file (`.wts-manifest.json`) is stored in the Drive root folder (`webex-meetings/` or `webex-meetings-bot/`). On every run the app checks the manifest before downloading — transcripts already uploaded are skipped automatically. The manifest is shared across machines via Drive. Pass `--reroute` to bypass the manifest and re-upload everything (useful after a folder-routing fix).
+
+`--local` mode uses its own manifest (`.wts-manifest.json` inside `--output-dir`) instead of the Drive one.
 
 ## Usage
 
 ```sh
-# Sync all transcripts from the last 30 days (default)
+# Sync all transcripts from the last 30 days (default) to Google Docs
 ./webex-scribe
 
 # Sync the last 180 days (auto-split into 30-day chunks)
@@ -130,6 +162,25 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 # Sync transcripts from all spaces a bot is a member of (uses WEBEX_BOT_TOKEN)
 ./webex-scribe --bot
 
+# Preview what would be uploaded and where, without writing anything
+./webex-scribe --dry-run
+
+# Save transcripts as local markdown files instead of Google Docs (no Google auth)
+./webex-scribe --local
+
+# Write a local markdown/JSON agenda for the next 7 days (negative N = past N days)
+./webex-scribe --calendar 7
+
+# Send a message to a Webex Space as yourself
+./webex-scribe --send-message "Standup moved to 10am" --space-name "Team Weekly Sync"
+
+# Schedule a new meeting, inviting all members of a space, and post a notice
+./webex-scribe --schedule-meeting "Sprint Planning" --start 2026-09-08T14:00:00-04:00 \
+  --duration 45 --agenda "Review backlog" --space-name "Team Weekly Sync" --notify-space
+
+# Non-interactive auth with a supplied token
+./webex-scribe --token <personal-access-token>
+
 # Force re-authentication with Webex
 ./webex-scribe --reauth
 
@@ -139,6 +190,8 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 
 ## Flags
 
+### Sync (default mode — Google Docs)
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-days` | 30 | How many days back to fetch (e.g. `180`). Ignored when `--from`/`--to` are set. Requests are split into 30-day chunks automatically. |
@@ -147,20 +200,53 @@ A manifest file (`.wts-manifest.json`) is stored in the `webex-meetings/` Drive 
 | `-space-id` | *(empty)* | Webex Space (room) ID to filter transcripts |
 | `-admin` | false | Include `meeting:admin_transcript_read` scope (org-wide transcripts) |
 | `-bot` | false | Use `WEBEX_BOT_TOKEN` to list bot spaces and sync transcripts into `webex-meetings-bot/` |
+| `-dry-run` | false | List transcripts that would be uploaded and the resolved Drive folder for each, without writing anything |
+| `-reroute` | false | Re-upload all transcripts regardless of manifest, to correct folder routing (advanced) |
+
+### Offline modes (no Google auth)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-local` | false | Save transcripts to local markdown files instead of uploading to Google Docs |
+| `-calendar` | 0 | Write a local calendar of scheduled meetings: positive N = next N days, negative N = past N days |
+| `-output-dir` | `~/webex-scribe-home` | Output directory for `--local` and `--calendar` modes |
+
+### Messaging & scheduling
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-send-message` | *(empty)* | Send a message to a Webex Space as yourself. Supports markdown. Use `-` to read the message from stdin. |
+| `-space-name` | *(empty)* | Webex Space name — resolved to an ID via the API (for `--send-message` and `--schedule-meeting`). Use `--space-id` for an exact ID. |
+| `-schedule-meeting` | *(empty)* | Schedule a new Webex meeting. Value is the meeting title. |
+| `-start` | *(empty)* | Meeting start time, e.g. `2026-09-08T14:00:00-04:00` (RFC3339, or `YYYY-MM-DD HH:MM` in local time) — required with `-schedule-meeting` |
+| `-duration` | 60 | Meeting duration in minutes |
+| `-agenda` | *(empty)* | Meeting agenda text |
+| `-invitees` | *(empty)* | Comma-separated email addresses to invite (combined with space members when `-space-name`/`-space-id` is set) |
+| `-notify-space` | false | After scheduling, post a meeting-info message to the space as yourself (requires `-space-name` or `-space-id`) |
+
+### Authentication
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-token` | *(empty)* | Webex Personal Access Token — validated, saved to disk, and used for this run (skips the interactive prompt) |
 | `-reauth` | false | Delete saved Webex token and re-authenticate |
 | `-google-reauth` | false | Delete saved Google token and re-authenticate |
+| `-version` | false | Print version and exit |
 
-For advanced OAuth2 flags (`-client-id`, `-client-secret`) run `webex-scribe -help-advanced`.
+For advanced OAuth2 and debug flags (`-client-id`, `-client-secret`, `-debug`, `-reroute`) run `webex-scribe -help-advanced`.
 
 ## Authentication Details
 
 **Webex:** The app checks for a token in this order:
-1. `WEBEX_TOKEN` env var / `.env` file (personal access token — recommended)
-2. `~/.webex-meeting-sync/.env` (saved interactively on first run)
-3. Saved OAuth2 token at `~/.config/webex-scribe/token.json`
-4. Interactive OAuth2 browser flow (if `WEBEX_CLIENT_ID` / `WEBEX_CLIENT_SECRET` are set)
+1. `-token` flag (validated and saved for future runs)
+2. `WEBEX_TOKEN` env var / `.env` file (personal access token — recommended)
+3. `~/.webex-meeting-sync/.env` (saved interactively on first run)
+4. Saved OAuth2 token at `~/.config/webex-scribe/token.json`
+5. Interactive OAuth2 browser flow (if `WEBEX_CLIENT_ID` / `WEBEX_CLIENT_SECRET` are set)
 
-**Google:** Checks in this order:
+Non-interactive environments (no TTY) exit with status **2** and print `WEBEX_TOKEN_EXPIRED` when no valid token is available, instead of prompting.
+
+**Google:** Checks in this order (skipped entirely in `--local` / `--calendar` modes):
 1. Application Default Credentials (`gcloud auth application-default login`)
 2. Saved in-app OAuth2 token at `~/.config/webex-scribe/google_token.json`
 3. Interactive OAuth2 browser flow (if `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` are set)
@@ -181,6 +267,29 @@ For advanced OAuth2 flags (`-client-id`, `-client-secret`) run `webex-scribe -he
 curl -H "Authorization: Bearer $WEBEX_TOKEN" \
   'https://webexapis.com/v1/rooms?type=group' | jq '.items[] | {id, title}'
 ```
+
+Pass `--space-name "<exact title>"` instead of `--space-id` for `--send-message` and `--schedule-meeting` — it is resolved to an ID via the rooms API.
+
+## Offline / local modes
+
+These modes skip Google auth entirely and write to `--output-dir` (default `~/webex-scribe-home`).
+
+**`--local`** downloads transcripts for the requested window (same `--days`/`--from`/`--to`/`--space-id`/`--admin` flags as the default sync) and writes one markdown file per meeting:
+
+```
+<output-dir>/<space-or-meeting-title>/<YYYY-MM-DD>-transcript.md
+<output-dir>/<space-or-meeting-title>/<YYYY-MM-DD>-summary.md   (when an AI summary is available)
+```
+
+Each transcript file includes the meeting date (Eastern time), space name, and participant list before the transcript body. Already-saved meetings are tracked in `<output-dir>/.wts-manifest.json` and skipped on later runs.
+
+**`--calendar N`** fetches scheduled meetings (positive N = next N days, negative N = past N days) and merges them into a rolling `<output-dir>/webex-calendar/webex-calendar.json`, keyed by local date and deduplicated by meeting ID — repeated runs accumulate rather than overwrite.
+
+## Messaging and scheduling meetings
+
+**`--send-message "<text>"`** posts to a Webex Space as the authenticated user (not a bot). Requires `--space-id` or `--space-name`. Pass `-` as the message to read from stdin, e.g. `git log -1 --format=%B | ./webex-scribe --send-message -`.
+
+**`--schedule-meeting "<title>"`** creates a new Webex meeting. Requires `--start`. When `--space-name`/`--space-id` is given, the meeting is linked to that space (appears in its Meetings tab) and all space members are automatically invited; `--invitees` adds people outside the space. Without a space, the meeting is standalone. `--notify-space` posts a follow-up message to the space showing the meeting time across ET, Ireland, and India, plus the agenda.
 
 ## Google Apps Script: Action Items → Google Tasks
 

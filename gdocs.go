@@ -162,12 +162,14 @@ func newGoogleClients(ctx context.Context) (*googleClients, error) {
 	}
 
 	return nil, fmt.Errorf(
-		"Google authentication failed. Add one of the following to your .env file:\n\n" +
-			"  GOOGLE_CLIENT_ID=<id>\n" +
-			"  GOOGLE_CLIENT_SECRET=<secret>\n\n" +
-			"Create a Desktop OAuth2 credential at:\n" +
-			"  https://console.cloud.google.com/apis/credentials\n" +
-			"and enable the Google Docs and Drive APIs for your project.\n",
+		"Google authentication failed. Try one of the following:\n\n" +
+			"  Option 1 (recommended): Application Default Credentials via gcloud\n" +
+			"    gcloud auth login --enable-gdrive-access\n\n" +
+			"  Option 2: OAuth2 client credentials — add to your .env file:\n" +
+			"    GOOGLE_CLIENT_ID=<id>\n" +
+			"    GOOGLE_CLIENT_SECRET=<secret>\n" +
+			"    (Create a Desktop OAuth2 credential at https://console.cloud.google.com/apis/credentials\n" +
+			"    and enable the Google Docs and Drive APIs for your project.)\n",
 	)
 }
 
