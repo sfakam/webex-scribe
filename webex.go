@@ -141,7 +141,7 @@ type Transcript struct {
 	// Empty when the API call fails or returns no data.
 	Participants []MeetingParticipant
 	// OccurrenceCount is the number of times this meeting title appears in
-	// webex-calendar.json. Set during classification; 0 means unknown.
+	// the calendar DB. Set during classification; 0 means unknown.
 	OccurrenceCount int
 }
 

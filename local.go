@@ -90,7 +90,7 @@ func deduplicateParticipants(participants []MeetingParticipant) []MeetingPartici
 //  2. Title contains 1:1/1-1/one-on-one keyword → 1:1 (unconditional).
 //  3. Exactly 2 unique participants (one is currentUserEmail) AND the other
 //     person's name appears in the title → 1:1.
-//  4. Title appears 2+ times in webex-calendar.json → recurring.
+//  4. Title appears 2+ times in the calendar DB → recurring.
 //  5. Everything else → standalone.
 //
 // Participants are deduplicated by email before counting so that rejoins
@@ -193,9 +193,9 @@ type localEntry struct {
 }
 
 // writeTranscriptLocally writes a Transcript to outputDir as markdown.
-// Layout: outputDir/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-transcript.md
+// Layout: outputDir/webex-meetings/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-transcript.md
 //
-//	outputDir/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-summary.md (when present)
+//	outputDir/webex-meetings/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-summary.md (when present)
 //
 // <category> is one of "1-1s", "recurring", or "standalone" derived from t.Category.
 // The start time (HHmm in ET, 24h) is always included in the filename so that
@@ -208,7 +208,7 @@ func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
 	if label == "" {
 		label = t.MeetingTitle
 	}
-	dir := filepath.Join(outputDir, t.Category.DriveFolder(), sanitizeFilename(label))
+	dir := filepath.Join(outputDir, "webex-meetings", t.Category.DriveFolder(), sanitizeFilename(label))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("creating output directory: %w", err)
 	}
@@ -322,7 +322,7 @@ func writeMeetingInfo(path string, t Transcript) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// CalendarEntry is a single meeting stored in webex-calendar.json.
+// CalendarEntry is a single meeting row from the calendar DB.
 type CalendarEntry struct {
 	ID              string `json:"id"`
 	Title           string `json:"title"`
@@ -343,7 +343,7 @@ type calendarFile struct {
 }
 
 // transcriptsToScheduledMeetings converts a slice of Transcripts to
-// ScheduledMeetings so they can be merged into webex-calendar.json.
+// ScheduledMeetings so they can be upserted into the calendar DB.
 // MeetingID is used as the stable dedup key.
 func transcriptsToScheduledMeetings(transcripts []Transcript) []ScheduledMeeting {
 	meetings := make([]ScheduledMeeting, 0, len(transcripts))

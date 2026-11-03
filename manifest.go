@@ -7,8 +7,7 @@
 //   - calendar     — scheduled meetings from the Webex API, with status tracking
 //
 // Legacy .wts-manifest.json files are auto-migrated on first open.
-// webex-calendar.json is exported after every calendar update for backward
-// compatibility with skills that read the JSON directly.
+// Skills query the calendar table directly via sqlite3.
 package main
 
 import (
@@ -264,23 +263,6 @@ func (lm *localManifest) BuildCalendarFile() *calendarFile {
 		cf.Meetings[k] = entries
 	}
 	return cf
-}
-
-// ExportCalendarJSON writes webex-calendar.json to dir from the DB, for
-// backward compatibility with skills that read the JSON file directly.
-func (lm *localManifest) ExportCalendarJSON(dir string) error {
-	cf := lm.BuildCalendarFile()
-	if cf == nil {
-		return nil
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cf, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "webex-calendar.json"), data, 0644)
 }
 
 func (lm *localManifest) close() {

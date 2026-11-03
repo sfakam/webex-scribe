@@ -401,7 +401,6 @@ func main() {
 
 	// Persist past transcripts + next 30 days of scheduled meetings into the
 	// DB calendar table BEFORE classifying so the recurring count is accurate.
-	calendarDir := filepath.Join(*outputDir, "webex-calendar")
 	if err := localMf.UpsertCalendar(transcriptsToScheduledMeetings(transcripts)); err != nil {
 		fmt.Fprintf(os.Stderr, "  warning: could not update calendar: %v\n", err)
 	}
@@ -414,7 +413,6 @@ func main() {
 		localMf.UpsertCalendar(upcoming)
 		localMf.MarkCancelledInWindow(now, now.AddDate(0, 0, 30), activeIDs)
 	}
-	localMf.ExportCalendarJSON(calendarDir)
 
 	// Classify each transcript using the same rules as /sf:meeting-notes.
 	cf := localMf.BuildCalendarFile()
@@ -762,17 +760,12 @@ func runScheduleMode(ctx context.Context, clientID, clientSecret string, adminMo
 	}
 	fmt.Printf("Found %d meeting(s).\n", len(meetings))
 
-	calendarDir := outputDir + "/webex-calendar"
 	calDB := loadLocalManifest(outputDir)
 	if err := calDB.UpsertCalendar(meetings); err != nil {
 		fmt.Fprintf(os.Stderr, "error updating calendar: %v\n", err)
 		os.Exit(1)
 	}
-	if err := calDB.ExportCalendarJSON(calendarDir); err != nil {
-		fmt.Fprintf(os.Stderr, "error writing calendar JSON: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Calendar updated:", filepath.Join(calendarDir, "webex-calendar.json"))
+	fmt.Println("Calendar updated in", filepath.Join(outputDir, webexScribeDB))
 }
 
 // runLocalTranscriptMode downloads transcripts for the requested window and
@@ -841,7 +834,6 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 
 	// Persist past transcripts + next 30 days of scheduled meetings into the
 	// DB calendar table BEFORE classifying so the recurring count is accurate.
-	localCalendarDir := filepath.Join(outputDir, "webex-calendar")
 	if err := lm.UpsertCalendar(transcriptsToScheduledMeetings(transcripts)); err != nil {
 		fmt.Fprintf(os.Stderr, "  warning: could not update calendar: %v\n", err)
 	}
@@ -854,7 +846,6 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 		lm.UpsertCalendar(upcoming)
 		lm.MarkCancelledInWindow(localNow, localNow.AddDate(0, 0, 30), activeIDs)
 	}
-	lm.ExportCalendarJSON(localCalendarDir)
 
 	// Classify each transcript using the same rules as /sf:meeting-notes.
 	localCF := lm.BuildCalendarFile()
