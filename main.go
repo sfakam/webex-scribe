@@ -267,6 +267,12 @@ func main() {
 	fmt.Println("Authenticating with Google...")
 	clients, err := newGoogleClients(ctx)
 	if err != nil {
+		if strings.Contains(err.Error(), "gcloud auth login") ||
+			strings.Contains(err.Error(), "invalid_scope") ||
+			strings.Contains(err.Error(), "invalid_grant") {
+			fmt.Fprintf(os.Stderr, "GOOGLE_AUTH_REQUIRED: %v\n", err)
+			os.Exit(3)
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -584,6 +590,12 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 	fmt.Println("Authenticating with Google (dry-run)...")
 	clients, err := newGoogleClients(ctx)
 	if err != nil {
+		if strings.Contains(err.Error(), "gcloud auth login") ||
+			strings.Contains(err.Error(), "invalid_scope") ||
+			strings.Contains(err.Error(), "invalid_grant") {
+			fmt.Fprintf(os.Stderr, "GOOGLE_AUTH_REQUIRED: %v\n", err)
+			os.Exit(3)
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
