@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -372,4 +373,86 @@ func sanitizeFilename(s string) string {
 		s = s[:80]
 	}
 	return s
+}
+
+var (
+	icsDTStartRe = regexp.MustCompile(`(?m)^DTSTART(?:;[^:]*)?:(.+)`)
+	icsSummaryRe = regexp.MustCompile(`(?m)^SUMMARY:(.+)`)
+)
+
+// icsTitleForMeeting scans ~/mail-cal-sync/calendar for an Outlook ICS event
+// whose start time is within ±30 minutes of start. Returns the ICS SUMMARY
+// (meeting title) if found, or "" if mail-cal-sync is absent or no match.
+// Intended as a fallback for personal-room meetings that lack a Webex title.
+func icsTitleForMeeting(start time.Time) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	calRoot := filepath.Join(home, "mail-cal-sync", "calendar",
+		start.UTC().Format("2006"), start.UTC().Format("01"))
+	dirs, err := os.ReadDir(calRoot)
+	if err != nil {
+		return "" // mail-cal-sync not installed — silent fallback
+	}
+	prefix := start.UTC().Format("20060102")
+	skipCals := map[string]bool{
+		"united_states_holidays": true,
+		"us_holidays":            true,
+	}
+	for _, d := range dirs {
+		if !d.IsDir() || skipCals[strings.ToLower(d.Name())] {
+			continue
+		}
+		matches, _ := filepath.Glob(filepath.Join(calRoot, d.Name(), prefix+"_*.ics"))
+		for _, path := range matches {
+			if title, ok := icsParseTitle(path, start); ok {
+				return title
+			}
+		}
+	}
+	return ""
+}
+
+// icsParseTitle returns the SUMMARY of an ICS file if its DTSTART is within
+// ±30 minutes of target, otherwise ("", false).
+func icsParseTitle(path string, target time.Time) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	text := string(data)
+
+	dtm := icsDTStartRe.FindStringSubmatch(text)
+	summ := icsSummaryRe.FindStringSubmatch(text)
+	if dtm == nil || summ == nil {
+		return "", false
+	}
+
+	raw := strings.TrimSpace(dtm[1])
+	var t time.Time
+	for _, layout := range []string{"20060102T150405Z", "20060102T150405", "20060102"} {
+		if parsed, err2 := time.Parse(layout, raw); err2 == nil {
+			t = parsed.UTC()
+			break
+		}
+	}
+	if t.IsZero() {
+		return "", false
+	}
+	diff := t.Sub(target)
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > 30*time.Minute {
+		return "", false
+	}
+
+	title := strings.TrimSpace(summ[1])
+	// Unescape ICS backslash sequences.
+	title = strings.NewReplacer(`\,`, ",", `\;`, ";", `\n`, " ", `\\`, `\`).Replace(title)
+	if title == "" {
+		return "", false
+	}
+	return title, true
 }

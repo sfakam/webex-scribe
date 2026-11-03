@@ -476,6 +476,10 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			if details.ScheduledType == "personalRoomMeeting" {
 				resolvedRoomID = ""
 				skipTitleMatch = true
+				if t := icsTitleForMeeting(startTime); t != "" {
+					item.MeetingTopic = t
+					fmt.Fprintf(os.Stderr, "        note: personal room — title from Outlook ICS: %q\n", t)
+				}
 			} else if details.RoomID != "" {
 				resolvedRoomID = details.RoomID
 				skipTitleMatch = true
