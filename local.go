@@ -173,19 +173,17 @@ var eastern = func() *time.Location {
 	return loc
 }()
 
-const localManifestFile = ".wts-manifest.json"
-
-// localEntry records a single locally-saved transcript.
-// The map key is the transcript record ID (from /meetingTranscripts).
-// MeetingID is the parent Webex meeting ID for cross-referencing.
+// localEntry is the data written to the manifest for each saved transcript.
+// The SQLite manifest (manifest.go) stores scalar fields in the transcripts
+// table and Participants in a separate participants table.
 type localEntry struct {
 	Title           string               `json:"title"`
 	Category        string               `json:"category"`
 	MeetingID       string               `json:"meetingId"`
 	MeetingDate     string               `json:"meetingDate"`
-	StartTime       string               `json:"startTime"`       // RFC3339 UTC
-	EndTime         string               `json:"endTime"`         // RFC3339 UTC, omitted if zero
-	DurationMinutes int                  `json:"durationMinutes"` // 0 if end unknown
+	StartTime       string               `json:"startTime"`
+	EndTime         string               `json:"endTime"`
+	DurationMinutes int                  `json:"durationMinutes"`
 	HostDisplayName string               `json:"hostDisplayName,omitempty"`
 	HostEmail       string               `json:"hostEmail,omitempty"`
 	SpaceName       string               `json:"spaceName,omitempty"`
@@ -193,47 +191,6 @@ type localEntry struct {
 	TranscriptPath  string               `json:"transcriptPath"`
 	InfoPath        string               `json:"infoPath,omitempty"`
 	WrittenAt       time.Time            `json:"writtenAt"`
-}
-
-// localManifest tracks which transcript IDs have been saved to disk so
-// repeated runs skip already-written files.
-type localManifest struct {
-	path    string
-	entries map[string]localEntry
-}
-
-// loadLocalManifest reads the manifest from outputDir. Missing file → empty
-// manifest. Corrupt file → logs a warning and returns an empty manifest so
-// the run can proceed, overwriting the corrupt file on first record().
-func loadLocalManifest(outputDir string) *localManifest {
-	path := filepath.Join(outputDir, localManifestFile)
-	lm := &localManifest{path: path, entries: make(map[string]localEntry)}
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return lm
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not read local manifest (starting fresh): %v\n", err)
-		return lm
-	}
-	if err := json.Unmarshal(data, &lm.entries); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not parse local manifest (starting fresh): %v\n", err)
-	}
-	return lm
-}
-
-func (lm *localManifest) known(id string) bool {
-	_, ok := lm.entries[id]
-	return ok
-}
-
-func (lm *localManifest) record(id string, e localEntry) error {
-	lm.entries[id] = e
-	data, err := json.MarshalIndent(lm.entries, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(lm.path, data, 0644)
 }
 
 // writeTranscriptLocally writes a Transcript to outputDir as markdown.

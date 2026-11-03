@@ -1,177 +1,183 @@
-// manifest.go implements a Drive-backed deduplication manifest for
-// webex-scribe.
-//
-// The manifest is stored as a JSON file named ".wts-manifest.json" inside the
-// "webex-meetings" root folder in Google Drive, so the same state is shared
-// across all machines that run the tool against the same Google account.
-//
-// Each entry in the manifest records:
-//
-//   - Transcript ID  → stable unique key from the Webex API.
-//   - SHA-256 hash   → computed from the raw VTT content. If the hash changes
-//     between runs the transcript is re-uploaded (e.g. Webex
-//     edited the transcript after the meeting).
-//   - Doc URL        → URL of the Google Doc created for this transcript.
-//   - Title          → human-readable label for the manifest file.
-//   - UploadedAt     → timestamp of the last successful upload.
+// manifest.go implements the local transcript manifest backed by SQLite.
+// The manifest tracks which transcripts have been saved so repeated runs skip
+// already-written files. It replaces the legacy .wts-manifest.json format;
+// existing JSON manifests are auto-migrated on first open.
 package main
 
 import (
-	"bytes"
-	"context"
-	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
+	"os"
+	"path/filepath"
 	"time"
 
-	driveapi "google.golang.org/api/drive/v3"
+	_ "modernc.org/sqlite"
 )
 
-const manifestFileName = ".wts-manifest.json"
+const (
+	localManifestDB   = ".wts-manifest.db"
+	localManifestJSON = ".wts-manifest.json" // legacy — migrated on first open
+)
 
-// manifestEntry records the details of a single uploaded transcript.
-type manifestEntry struct {
-	// Hash is the hex-encoded SHA-256 digest of the transcript VTT content at
-	// the time it was last uploaded.
-	Hash string `json:"hash"`
+const dbSchema = `
+CREATE TABLE IF NOT EXISTS transcripts (
+	transcript_id    TEXT PRIMARY KEY,
+	meeting_id       TEXT NOT NULL DEFAULT '',
+	title            TEXT NOT NULL DEFAULT '',
+	category         TEXT NOT NULL DEFAULT '',
+	meeting_date     TEXT NOT NULL DEFAULT '',
+	start_time       TEXT NOT NULL DEFAULT '',
+	end_time         TEXT NOT NULL DEFAULT '',
+	duration_minutes INTEGER NOT NULL DEFAULT 0,
+	host_name        TEXT NOT NULL DEFAULT '',
+	host_email       TEXT NOT NULL DEFAULT '',
+	space_name       TEXT NOT NULL DEFAULT '',
+	participant_count INTEGER NOT NULL DEFAULT 0,
+	transcript_path  TEXT NOT NULL DEFAULT '',
+	info_path        TEXT NOT NULL DEFAULT '',
+	written_at       TEXT NOT NULL DEFAULT ''
+);
 
-	// TranscriptURL is the Google Docs edit URL of the Transcript document.
-	TranscriptURL string `json:"transcriptURL"`
+CREATE TABLE IF NOT EXISTS participants (
+	transcript_id TEXT NOT NULL,
+	display_name  TEXT NOT NULL DEFAULT '',
+	email         TEXT NOT NULL DEFAULT '',
+	is_host       INTEGER NOT NULL DEFAULT 0,
+	FOREIGN KEY (transcript_id) REFERENCES transcripts(transcript_id)
+);
 
-	// SummaryURL is the Google Docs edit URL of the Summary document.
-	// It is empty when no AI summary was available for the meeting.
-	SummaryURL string `json:"summaryURL,omitempty"`
+CREATE INDEX IF NOT EXISTS idx_participants_tid  ON participants(transcript_id);
+CREATE INDEX IF NOT EXISTS idx_transcripts_date  ON transcripts(meeting_date);
+CREATE INDEX IF NOT EXISTS idx_transcripts_cat   ON transcripts(category);
+`
 
-	// Title is the meeting title as returned by the Webex API.
-	Title string `json:"title"`
-
-	// MeetingDate is the UTC start date of the meeting (YYYY-MM-DD).
-	MeetingDate string `json:"meetingDate,omitempty"`
-
-	// UploadedAt records when this entry was last written.
-	UploadedAt time.Time `json:"uploadedAt"`
+// localManifest tracks transcript downloads in a SQLite database.
+// The map key is the Webex transcript record ID (from /meetingTranscripts).
+type localManifest struct {
+	db *sql.DB
 }
 
-// driveManifest wraps a manifest map together with the Drive file ID of the
-// backing file, so saves can update the existing file rather than creating a
-// new one each time.
-type driveManifest struct {
-	entries map[string]manifestEntry
-	drive   *driveapi.Service
-	folderID string // ID of the webex-meetings root Drive folder
-	fileID   string // Drive file ID of the manifest; empty if not yet created
-}
-
-// loadDriveManifest fetches the manifest JSON file from the given Drive folder.
-// It returns an empty manifest when the file does not exist yet.
-func loadDriveManifest(ctx context.Context, svc *driveapi.Service, folderID string) (*driveManifest, error) {
-	dm := &driveManifest{
-		entries:  make(map[string]manifestEntry),
-		drive:    svc,
-		folderID: folderID,
-	}
-
-	// Search for an existing manifest file in the root folder.
-	q := fmt.Sprintf("name='%s' and '%s' in parents and trashed=false", manifestFileName, folderID)
-	list, err := svc.Files.List().Q(q).Fields("files(id)").Context(ctx).Do()
+// loadLocalManifest opens (or creates) the SQLite manifest in outputDir.
+// If a legacy .wts-manifest.json exists and the DB is empty, it is migrated
+// automatically and renamed to .wts-manifest.json.migrated.
+func loadLocalManifest(outputDir string) *localManifest {
+	dbPath := filepath.Join(outputDir, localManifestDB)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("searching for manifest in Drive: %w", err)
+		fmt.Fprintf(os.Stderr, "warning: could not open manifest db — falling back to in-memory: %v\n", err)
+		db, _ = sql.Open("sqlite", ":memory:")
+	}
+	db.Exec("PRAGMA journal_mode=WAL")
+	db.Exec("PRAGMA synchronous=NORMAL")
+
+	if _, err := db.Exec(dbSchema); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not initialise manifest schema: %v\n", err)
 	}
 
-	if len(list.Files) == 0 {
-		// No manifest yet — start fresh.
-		return dm, nil
-	}
+	lm := &localManifest{db: db}
 
-	dm.fileID = list.Files[0].Id
-
-	// Download the file content.
-	resp, err := svc.Files.Get(dm.fileID).Context(ctx).Download()
-	if err != nil {
-		return nil, fmt.Errorf("downloading manifest from Drive: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading manifest body: %w", err)
-	}
-
-	if err := json.Unmarshal(data, &dm.entries); err != nil {
-		return nil, fmt.Errorf("parsing manifest JSON: %w", err)
-	}
-	return dm, nil
-}
-
-// save writes the current manifest back to Google Drive, updating the existing
-// file or creating a new one if this is the first save.
-func (dm *driveManifest) save(ctx context.Context) error {
-	data, err := json.MarshalIndent(dm.entries, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshalling manifest: %w", err)
-	}
-
-	content := bytes.NewReader(data)
-
-	if dm.fileID == "" {
-		// First save — create the file inside the root folder.
-		f, err := dm.drive.Files.Create(&driveapi.File{
-			Name:    manifestFileName,
-			Parents: []string{dm.folderID},
-		}).Media(content).Fields("id").Context(ctx).Do()
-		if err != nil {
-			return fmt.Errorf("creating manifest file in Drive: %w", err)
+	// Auto-migrate legacy JSON manifest if the DB is still empty.
+	jsonPath := filepath.Join(outputDir, localManifestJSON)
+	if _, statErr := os.Stat(jsonPath); statErr == nil {
+		if err := lm.migrateFromJSON(jsonPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: manifest migration failed: %v\n", err)
 		}
-		dm.fileID = f.Id
+	}
+
+	return lm
+}
+
+// count returns the number of transcripts recorded in the manifest.
+func (lm *localManifest) count() int {
+	var n int
+	lm.db.QueryRow("SELECT COUNT(*) FROM transcripts").Scan(&n)
+	return n
+}
+
+// known reports whether a transcript ID has already been saved.
+func (lm *localManifest) known(id string) bool {
+	var n int
+	lm.db.QueryRow("SELECT COUNT(*) FROM transcripts WHERE transcript_id = ?", id).Scan(&n)
+	return n > 0
+}
+
+// record upserts a transcript entry and replaces its participant rows.
+func (lm *localManifest) record(id string, e localEntry) error {
+	tx, err := lm.db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`INSERT OR REPLACE INTO transcripts
+		(transcript_id, meeting_id, title, category, meeting_date,
+		 start_time, end_time, duration_minutes, host_name, host_email,
+		 space_name, participant_count, transcript_path, info_path, written_at)
+		VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?)`,
+		id, e.MeetingID, e.Title, e.Category, e.MeetingDate,
+		e.StartTime, e.EndTime, e.DurationMinutes, e.HostDisplayName, e.HostEmail,
+		e.SpaceName, len(e.Participants), e.TranscriptPath, e.InfoPath,
+		e.WrittenAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("upserting transcript: %w", err)
+	}
+
+	if _, err := tx.Exec("DELETE FROM participants WHERE transcript_id = ?", id); err != nil {
+		return fmt.Errorf("clearing participants: %w", err)
+	}
+	for _, p := range e.Participants {
+		isHost := 0
+		if p.IsHost {
+			isHost = 1
+		}
+		if _, err := tx.Exec(
+			"INSERT INTO participants (transcript_id, display_name, email, is_host) VALUES (?,?,?,?)",
+			id, p.DisplayName, p.Email, isHost,
+		); err != nil {
+			return fmt.Errorf("inserting participant: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (lm *localManifest) close() {
+	if lm.db != nil {
+		lm.db.Close()
+	}
+}
+
+// migrateFromJSON imports all entries from the legacy JSON manifest into SQLite,
+// then renames the JSON file so it is not re-processed on subsequent runs.
+func (lm *localManifest) migrateFromJSON(jsonPath string) error {
+	var existing int
+	lm.db.QueryRow("SELECT COUNT(*) FROM transcripts").Scan(&existing)
+	if existing > 0 {
+		return nil // DB already has data — skip migration
+	}
+
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return err
+	}
+	var entries map[string]localEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return fmt.Errorf("parsing legacy manifest: %w", err)
+	}
+	if len(entries) == 0 {
 		return nil
 	}
 
-	// Update the existing file in place.
-	if _, err := dm.drive.Files.Update(dm.fileID, &driveapi.File{}).
-		Media(content).Context(ctx).Do(); err != nil {
-		return fmt.Errorf("updating manifest file in Drive: %w", err)
+	ok := 0
+	for id, e := range entries {
+		if err := lm.record(id, e); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not migrate %q: %v\n", e.Title, err)
+			continue
+		}
+		ok++
 	}
-	return nil
-}
-
-// contentHash returns the hex-encoded SHA-256 digest of content.
-func contentHash(content string) string {
-	sum := sha256.Sum256([]byte(content))
-	return fmt.Sprintf("%x", sum)
-}
-
-// knownID reports whether the transcript ID is already recorded in the manifest,
-// regardless of content. Used to skip the content download entirely for
-// transcripts that have been previously uploaded.
-func (dm *driveManifest) knownID(id string) bool {
-	_, ok := dm.entries[id]
-	return ok
-}
-
-// alreadyUploaded reports whether t has been uploaded before with identical
-// content. It returns true only when the transcript ID is present in the
-// manifest and its stored hash matches the hash of t.Content.
-func (dm *driveManifest) alreadyUploaded(t Transcript) bool {
-	entry, ok := dm.entries[t.ID]
-	if !ok {
-		return false
-	}
-	return entry.Hash == contentHash(t.Content)
-}
-
-// record stores a successful upload in the in-memory manifest and persists it
-// to Drive immediately so a partial run is never lost.
-//
-// summaryURL may be empty when no AI summary was available for the meeting.
-func (dm *driveManifest) record(ctx context.Context, t Transcript, transcriptURL, summaryURL string) error {
-	dm.entries[t.ID] = manifestEntry{
-		Hash:          contentHash(t.Content),
-		TranscriptURL: transcriptURL,
-		SummaryURL:    summaryURL,
-		Title:         t.MeetingTitle,
-		MeetingDate:   t.StartTime.UTC().Format("2006-01-02"),
-		UploadedAt:    time.Now().UTC(),
-	}
-	return dm.save(ctx)
+	fmt.Printf("  Migrated %d/%d entries from .wts-manifest.json → .wts-manifest.db\n", ok, len(entries))
+	return os.Rename(jsonPath, jsonPath+".migrated")
 }

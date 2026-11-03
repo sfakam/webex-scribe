@@ -794,7 +794,7 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 		os.Exit(1)
 	}
 	lm := loadLocalManifest(outputDir)
-	fmt.Printf("Local manifest: %d previously saved transcript(s).\n\n", len(lm.entries))
+	fmt.Printf("Local manifest: %d previously saved transcript(s).\n\n", lm.count())
 
 	var toDownload []transcriptItem
 	var skipped int
