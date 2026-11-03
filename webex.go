@@ -447,7 +447,7 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			fmt.Fprintf(os.Stderr, "        warning: skipping — %v\n", err)
 			continue
 		}
-		summary, err := fetchMeetingSummary(client, item.MeetingID)
+		summary, summaryParticipants, err := fetchMeetingSummary(client, item.MeetingID)
 		if err != nil {
 			// Summary is optional — log and continue without it.
 			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
@@ -523,6 +523,14 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			participants = parseTranscriptSpeakers(content)
 			if len(participants) > 0 {
 				fmt.Fprintf(os.Stderr, "        note: participant API empty — extracted %d speakers from transcript\n", len(participants))
+			}
+		}
+		// Always merge summary attendees — catches people who attended but didn't speak.
+		if len(summaryParticipants) > 0 {
+			before := len(participants)
+			participants = mergeParticipants(participants, summaryParticipants)
+			if added := len(participants) - before; added > 0 {
+				fmt.Fprintf(os.Stderr, "        note: added %d silent attendee(s) from AI summary\n", added)
 			}
 		}
 
@@ -653,6 +661,31 @@ func parseTranscriptSpeakers(content string) []MeetingParticipant {
 		}
 		seen[name] = struct{}{}
 		out = append(out, MeetingParticipant{DisplayName: name})
+	}
+	return out
+}
+
+// mergeParticipants returns base with any entries from extra not already
+// present, matched by email first then by display name (case-insensitive).
+func mergeParticipants(base, extra []MeetingParticipant) []MeetingParticipant {
+	known := make(map[string]bool, len(base))
+	for _, p := range base {
+		if key := strings.ToLower(p.Email); key != "" {
+			known[key] = true
+		} else {
+			known[strings.ToLower(p.DisplayName)] = true
+		}
+	}
+	out := base
+	for _, p := range extra {
+		key := strings.ToLower(p.Email)
+		if key == "" {
+			key = strings.ToLower(p.DisplayName)
+		}
+		if key != "" && !known[key] {
+			known[key] = true
+			out = append(out, p)
+		}
 	}
 	return out
 }
@@ -898,21 +931,23 @@ func parseLinkNext(link string) string {
 // The returned string is a plain-text block containing the meeting notes
 // followed by a numbered list of action items, suitable for direct insertion
 // into a Google Doc.
-func fetchMeetingSummary(client *WebexClient, meetingID string) (string, error) {
+// fetchMeetingSummary fetches the AI-generated summary and any structured
+// participant list for meetingID. Returns (summaryText, participants, error).
+func fetchMeetingSummary(client *WebexClient, meetingID string) (string, []MeetingParticipant, error) {
 	apiURL := fmt.Sprintf("%s/meetingSummaries?meetingId=%s", webexAPIBase, url.QueryEscape(meetingID))
 
 	resp, err := client.httpClient.Get(apiURL)
 	if err != nil {
-		return "", fmt.Errorf("summary request: %w", err)
+		return "", nil, fmt.Errorf("summary request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("no AI summary for meeting %s", meetingID)
+		return "", nil, fmt.Errorf("no AI summary for meeting %s", meetingID)
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("summary HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", nil, fmt.Errorf("summary HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var result struct {
@@ -923,21 +958,40 @@ func fetchMeetingSummary(client *WebexClient, meetingID string) (string, error) 
 			ActionItems []struct {
 				Content string `json:"content"`
 			} `json:"actionItems"`
+			Participants []struct {
+				Name  string `json:"name"`
+				Email string `json:"email"`
+			} `json:"participants"`
 		} `json:"items"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decoding summary: %w", err)
+		return "", nil, fmt.Errorf("decoding summary: %w", err)
 	}
 
 	if len(result.Items) == 0 {
-		return "", fmt.Errorf("no AI summary for meeting %s", meetingID)
+		return "", nil, fmt.Errorf("no AI summary for meeting %s", meetingID)
 	}
 
 	item := result.Items[0]
 	notesText := stripHTML(item.Notes.Content)
 
 	if notesText == "" && len(item.ActionItems) == 0 {
-		return "", fmt.Errorf("empty AI summary for meeting %s", meetingID)
+		return "", nil, fmt.Errorf("empty AI summary for meeting %s", meetingID)
+	}
+
+	// Collect structured participants if the API returned them.
+	var summaryParticipants []MeetingParticipant
+	for _, p := range item.Participants {
+		if p.Name != "" {
+			summaryParticipants = append(summaryParticipants, MeetingParticipant{
+				DisplayName: p.Name,
+				Email:       p.Email,
+			})
+		}
+	}
+	// Text-based fallback: parse "Attendees" section from the summary text.
+	if len(summaryParticipants) == 0 {
+		summaryParticipants = parseSummaryParticipants(notesText)
 	}
 
 	var sb strings.Builder
@@ -951,7 +1005,39 @@ func fetchMeetingSummary(client *WebexClient, meetingID string) (string, error) 
 			fmt.Fprintf(&sb, "%d. %s\n", i+1, ai.Content)
 		}
 	}
-	return sb.String(), nil
+	return sb.String(), summaryParticipants, nil
+}
+
+// parseSummaryParticipants extracts attendee names from the plain-text AI
+// summary. Webex summaries typically include an "Attendees" heading followed
+// by one name per line. Returns nil when no attendee section is found.
+func parseSummaryParticipants(text string) []MeetingParticipant {
+	lines := strings.Split(text, "\n")
+	inAttendees := false
+	var out []MeetingParticipant
+	seen := make(map[string]bool)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if lower == "attendees" || lower == "participants" || lower == "attendees:" || lower == "participants:" {
+			inAttendees = true
+			continue
+		}
+		// Stop at the next section heading (empty line after names, or new heading).
+		if inAttendees {
+			if trimmed == "" {
+				break
+			}
+			// Strip leading list markers (-, •, *).
+			name := strings.TrimLeft(trimmed, "-•* \t")
+			name = strings.TrimSpace(name)
+			if name != "" && !seen[strings.ToLower(name)] {
+				seen[strings.ToLower(name)] = true
+				out = append(out, MeetingParticipant{DisplayName: name})
+			}
+		}
+	}
+	return out
 }
 
 // htmlTagRE matches any HTML tag for use in stripHTML.
