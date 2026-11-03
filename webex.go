@@ -473,7 +473,7 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			if t, err := time.Parse(time.RFC3339, details.End); err == nil {
 				endTime = t
 			}
-			if details.ScheduledType == "personalRoomMeeting" {
+			if details.ScheduledType == "personalRoomMeeting" || isPersonalRoomTitle(item.MeetingTopic) {
 				resolvedRoomID = ""
 				skipTitleMatch = true
 				if t := icsTitleForMeeting(startTime); t != "" {
@@ -523,6 +523,15 @@ func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Tran
 			participants = parseTranscriptSpeakers(content)
 			if len(participants) > 0 {
 				fmt.Fprintf(os.Stderr, "        note: participant API empty — extracted %d speakers from transcript\n", len(participants))
+			}
+		}
+
+		// Secondary ICS fallback: if the topic still looks like a personal
+		// room (API may not return scheduledType for older meetings), try ICS.
+		if isPersonalRoomTitle(item.MeetingTopic) {
+			if t := icsTitleForMeeting(startTime); t != "" {
+				item.MeetingTopic = t
+				fmt.Fprintf(os.Stderr, "        note: personal room — title from Outlook ICS: %q\n", t)
 			}
 		}
 

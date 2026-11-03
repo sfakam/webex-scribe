@@ -380,6 +380,15 @@ var (
 	icsSummaryRe = regexp.MustCompile(`(?m)^SUMMARY:(.+)`)
 )
 
+// isPersonalRoomTitle returns true when the meeting title indicates a Webex
+// personal room session that has no meaningful scheduled title — e.g.
+// "Sherif Fathalla's Personal Room", "Tracey's Webex", "Mindy's Webex Room".
+func isPersonalRoomTitle(title string) bool {
+	lower := strings.ToLower(title)
+	return strings.Contains(lower, "personal room") ||
+		strings.Contains(lower, "'s webex")
+}
+
 // icsTitleForMeeting scans ~/mail-cal-sync/calendar for an Outlook ICS event
 // whose start time is within ±30 minutes of start. Returns the ICS SUMMARY
 // (meeting title) if found, or "" if mail-cal-sync is absent or no match.
