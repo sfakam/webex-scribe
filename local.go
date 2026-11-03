@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -147,20 +146,20 @@ func classifyMeeting(title string, cf *calendarFile, participants []MeetingParti
 	return CategoryOneOff
 }
 
-// loadCalendarFile reads webex-calendar.json from calendarDir.
-// Returns nil when the file is missing or unparseable — callers fall back to
-// keyword-only classification in that case.
-func loadCalendarFile(calendarDir string) *calendarFile {
-	path := filepath.Join(calendarDir, "webex-calendar.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
+// countOccurrences returns how many times title appears across all dates in cf.
+func countOccurrences(title string, cf *calendarFile) int {
+	if cf == nil {
+		return 0
 	}
-	var cf calendarFile
-	if err := json.Unmarshal(data, &cf); err != nil {
-		return nil
+	n := 0
+	for _, entries := range cf.Meetings {
+		for _, e := range entries {
+			if strings.EqualFold(e.Title, title) {
+				n++
+			}
+		}
 	}
-	return &cf
+	return n
 }
 
 // eastern is America/New_York, used for all display-facing time formatting.
@@ -271,9 +270,10 @@ type meetingInfoJSON struct {
 	MeetingID       string               `json:"meetingId"`
 	Title           string               `json:"title"`
 	Category        string               `json:"category"`
-	StartTime       string               `json:"startTime"`       // RFC3339 UTC
-	EndTime         string               `json:"endTime"`         // RFC3339 UTC, omitted if zero
-	DurationMinutes int                  `json:"durationMinutes"` // 0 if end time unknown
+	OccurrenceCount int                  `json:"occurrenceCount,omitempty"` // how many times this title appears in calendar
+	StartTime       string               `json:"startTime"`                 // RFC3339 UTC
+	EndTime         string               `json:"endTime"`                   // RFC3339 UTC, omitted if zero
+	DurationMinutes int                  `json:"durationMinutes"`           // 0 if end time unknown
 	HostDisplayName string               `json:"hostDisplayName,omitempty"`
 	HostEmail       string               `json:"hostEmail,omitempty"`
 	Agenda          string               `json:"agenda,omitempty"`
@@ -295,6 +295,7 @@ func writeMeetingInfo(path string, t Transcript) error {
 		MeetingID:       t.MeetingID,
 		Title:           t.MeetingTitle,
 		Category:        t.Category.String(),
+		OccurrenceCount: t.OccurrenceCount,
 		StartTime:       t.StartTime.UTC().Format(time.RFC3339),
 		HostDisplayName: t.HostDisplayName,
 		HostEmail:       t.HostEmail,
@@ -357,78 +358,6 @@ func transcriptsToScheduledMeetings(transcripts []Transcript) []ScheduledMeeting
 		})
 	}
 	return meetings
-}
-
-// upsertCalendarJSON merges meetings into calendarDir/webex-calendar.json.
-// Existing entries with the same ID are updated; new ones are added.
-// Entries are grouped by local start date and sorted by start time within
-// each date, so repeated runs accumulate a rolling calendar rather than
-// overwriting previous data.
-func upsertCalendarJSON(calendarDir string, meetings []ScheduledMeeting) (string, error) {
-	if err := os.MkdirAll(calendarDir, 0755); err != nil {
-		return "", fmt.Errorf("creating calendar dir: %w", err)
-	}
-	path := filepath.Join(calendarDir, "webex-calendar.json")
-
-	// Load existing file — missing is fine, corrupt logs a warning.
-	cf := calendarFile{Meetings: make(map[string][]CalendarEntry)}
-	if data, err := os.ReadFile(path); err == nil {
-		if parseErr := json.Unmarshal(data, &cf); parseErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not parse existing webex-calendar.json (starting fresh): %v\n", parseErr)
-			cf.Meetings = make(map[string][]CalendarEntry)
-		}
-	}
-
-	// Flatten all existing entries into a map keyed by meeting ID.
-	all := make(map[string]CalendarEntry)
-	for _, entries := range cf.Meetings {
-		for _, e := range entries {
-			all[e.ID] = e
-		}
-	}
-
-	// Merge: new entries overwrite existing ones with the same ID.
-	for _, m := range meetings {
-		all[m.ID] = CalendarEntry{
-			ID:              m.ID,
-			Title:           m.Title,
-			Start:           m.Start.UTC().Format(time.RFC3339),
-			End:             m.End.UTC().Format(time.RFC3339),
-			DurationMinutes: int(m.End.Sub(m.Start).Minutes()),
-			Agenda:          m.Agenda,
-			Host:            m.HostDisplayName,
-			WebLink:         m.WebLink,
-			Status:          m.Status,
-		}
-	}
-
-	// Re-bucket by local date.
-	cf.Meetings = make(map[string][]CalendarEntry)
-	for _, entry := range all {
-		t, _ := time.Parse(time.RFC3339, entry.Start)
-		dateKey := t.In(eastern).Format("2006-01-02")
-		cf.Meetings[dateKey] = append(cf.Meetings[dateKey], entry)
-	}
-
-	// Sort entries within each date by start time (RFC3339 strings sort correctly).
-	for dateKey := range cf.Meetings {
-		entries := cf.Meetings[dateKey]
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].Start < entries[j].Start
-		})
-		cf.Meetings[dateKey] = entries
-	}
-
-	cf.LastUpdated = time.Now().UTC().Format(time.RFC3339)
-
-	data, err := json.MarshalIndent(cf, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("marshalling calendar: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return "", fmt.Errorf("writing webex-calendar.json: %w", err)
-	}
-	return path, nil
 }
 
 // sanitizeFilename replaces characters that are unsafe in file/directory names.

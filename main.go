@@ -396,26 +396,39 @@ func main() {
 		return
 	}
 
-	// Classify each transcript using the same rules as /sf:meeting-notes.
+	// Open the DB (used for both transcript dedup and calendar storage).
+	localMf := loadLocalManifest(*outputDir)
+
+	// Persist past transcripts + next 30 days of scheduled meetings into the
+	// DB calendar table BEFORE classifying so the recurring count is accurate.
 	calendarDir := filepath.Join(*outputDir, "webex-calendar")
-	cf := loadCalendarFile(calendarDir)
+	if err := localMf.UpsertCalendar(transcriptsToScheduledMeetings(transcripts)); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not update calendar: %v\n", err)
+	}
+	now := time.Now()
+	if upcoming, err := webexClient.fetchScheduledMeetings(now, now.AddDate(0, 0, 30)); err == nil {
+		activeIDs := make(map[string]bool, len(upcoming))
+		for _, m := range upcoming {
+			activeIDs[m.ID] = true
+		}
+		localMf.UpsertCalendar(upcoming)
+		localMf.MarkCancelledInWindow(now, now.AddDate(0, 0, 30), activeIDs)
+	}
+	localMf.ExportCalendarJSON(calendarDir)
+
+	// Classify each transcript using the same rules as /sf:meeting-notes.
+	cf := localMf.BuildCalendarFile()
 	currentUserEmail := webexClient.CurrentUserEmail()
 	for i := range transcripts {
 		transcripts[i].Category = classifyMeeting(transcripts[i].MeetingTitle, cf, transcripts[i].Participants, currentUserEmail, transcripts[i].SpaceType)
+		transcripts[i].OccurrenceCount = countOccurrences(transcripts[i].MeetingTitle, cf)
 		fmt.Printf("  [classify] %s → %s\n", transcripts[i].MeetingTitle, transcripts[i].Category)
-	}
-
-	// Merge downloaded meetings into webex-calendar.json so every run keeps
-	// the calendar up to date, not just --calendar runs.
-	if _, err := upsertCalendarJSON(calendarDir, transcriptsToScheduledMeetings(transcripts)); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: could not update webex-calendar.json: %v\n", err)
 	}
 
 	// Write transcripts to local disk first (same layout as --local mode).
 	// This keeps a local cache regardless of upload outcome and ensures both
 	// modes produce identical file trees under outputDir.
 	fmt.Printf("\nSaving %d transcript(s) locally to %s...\n", len(transcripts), *outputDir)
-	localMf := loadLocalManifest(*outputDir)
 	for _, t := range transcripts {
 		path, err := writeTranscriptLocally(*outputDir, t)
 		if err != nil {
@@ -619,7 +632,8 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 		return
 	}
 
-	dryRunCF := loadCalendarFile(filepath.Join(outputDir, "webex-calendar"))
+	dryRunDB := loadLocalManifest(outputDir)
+	dryRunCF := dryRunDB.BuildCalendarFile()
 
 	fmt.Printf("\nDry run — %d transcript(s) found:\n\n", len(allItems))
 	fmt.Printf("  %-6s  %-35s  %-12s  %-10s  %-24s  %-24s  %-24s  %-12s  %-24s  %s\n",
@@ -749,12 +763,16 @@ func runScheduleMode(ctx context.Context, clientID, clientSecret string, adminMo
 	fmt.Printf("Found %d meeting(s).\n", len(meetings))
 
 	calendarDir := outputDir + "/webex-calendar"
-	path, err := upsertCalendarJSON(calendarDir, meetings)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error writing calendar: %v\n", err)
+	calDB := loadLocalManifest(outputDir)
+	if err := calDB.UpsertCalendar(meetings); err != nil {
+		fmt.Fprintf(os.Stderr, "error updating calendar: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("Calendar updated:", path)
+	if err := calDB.ExportCalendarJSON(calendarDir); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing calendar JSON: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Calendar updated:", filepath.Join(calendarDir, "webex-calendar.json"))
 }
 
 // runLocalTranscriptMode downloads transcripts for the requested window and
@@ -821,18 +839,29 @@ func runLocalTranscriptMode(ctx context.Context, clientID, clientSecret string, 
 	fmt.Printf("\nFetching %d new transcript(s) from Webex (not previously saved)%s...\n", len(toDownload), rerouteNote)
 	transcripts := downloadTranscriptItems(webexClient, toDownload)
 
-	// Classify each transcript using the same rules as /sf:meeting-notes.
+	// Persist past transcripts + next 30 days of scheduled meetings into the
+	// DB calendar table BEFORE classifying so the recurring count is accurate.
 	localCalendarDir := filepath.Join(outputDir, "webex-calendar")
-	localCF := loadCalendarFile(localCalendarDir)
+	if err := lm.UpsertCalendar(transcriptsToScheduledMeetings(transcripts)); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not update calendar: %v\n", err)
+	}
+	localNow := time.Now()
+	if upcoming, err := webexClient.fetchScheduledMeetings(localNow, localNow.AddDate(0, 0, 30)); err == nil {
+		activeIDs := make(map[string]bool, len(upcoming))
+		for _, m := range upcoming {
+			activeIDs[m.ID] = true
+		}
+		lm.UpsertCalendar(upcoming)
+		lm.MarkCancelledInWindow(localNow, localNow.AddDate(0, 0, 30), activeIDs)
+	}
+	lm.ExportCalendarJSON(localCalendarDir)
+
+	// Classify each transcript using the same rules as /sf:meeting-notes.
+	localCF := lm.BuildCalendarFile()
 	localUserEmail := webexClient.CurrentUserEmail()
 	for i := range transcripts {
 		transcripts[i].Category = classifyMeeting(transcripts[i].MeetingTitle, localCF, transcripts[i].Participants, localUserEmail, transcripts[i].SpaceType)
 		fmt.Printf("  [classify] %s → %s\n", transcripts[i].MeetingTitle, transcripts[i].Category)
-	}
-
-	// Merge downloaded meetings into webex-calendar.json.
-	if _, err := upsertCalendarJSON(localCalendarDir, transcriptsToScheduledMeetings(transcripts)); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: could not update webex-calendar.json: %v\n", err)
 	}
 
 	var saved int
