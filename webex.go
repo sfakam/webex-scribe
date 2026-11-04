@@ -102,10 +102,10 @@ type WebexClient struct {
 	meetingDetailsMu    sync.Mutex
 	meetingDetailsCache map[string]MeetingDetails
 
-	// currentUserEmail is the email of the authenticated user, populated lazily
-	// by CurrentUserEmail().
-	currentUserOnce  sync.Once
-	currentUserEmail string
+	// currentUserEmail and currentUserDisplayName are populated lazily by CurrentUserEmail().
+	currentUserOnce        sync.Once
+	currentUserEmail       string
+	currentUserDisplayName string
 }
 
 // Transcript holds the metadata, raw VTT content, and optional AI summary of
@@ -143,6 +143,12 @@ type Transcript struct {
 	// OccurrenceCount is the number of times this meeting title appears in
 	// the calendar DB. Set during classification; 0 means unknown.
 	OccurrenceCount int
+	// PreClassified is true when the transcript was loaded from the local SQLite
+	// DB (via loadForUpload) and already carries a valid Category. Drive mode
+	// skips re-classification for these to preserve what local mode stored.
+	PreClassified   bool
+	LocalFolderName string // folder name computed by writeTranscriptLocally; used by Drive upload
+	LocalPath       string // full path to the written transcript.md; used by Drive upload to read content from disk
 }
 
 // newWebexClient returns a WebexClient authenticated with the Webex API.
@@ -434,132 +440,168 @@ func listTranscriptItems(ctx context.Context, client *WebexClient, from, to stri
 	return allItems, nil
 }
 
-// downloadTranscriptItems fetches the VTT content and AI summary for each item
-// in items and returns the fully populated Transcript slice. Items whose content
-// cannot be downloaded are logged as warnings and omitted from the result.
-func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Transcript {
-	var transcripts []Transcript
-	for i, item := range items {
-		startTime, _ := time.Parse(time.RFC3339, item.StartTime)
-		fmt.Printf("  [%d/%d] fetching (new) %s (%s)\n", i+1, len(items), item.MeetingTopic, startTime.Format("Jan 2, 2006"))
-		content, err := downloadTranscript(client, item.ID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "        warning: skipping — %v\n", err)
-			continue
-		}
-		summary, summaryParticipants, err := fetchMeetingSummary(client, item.MeetingID)
-		if err != nil {
-			// Summary is optional — log and continue without it.
-			fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
-		}
-		// Resolve the Space name and member list.
-		// Resolution order:
-		//  1. GET /meetings/{meetingId} — authoritative; gives roomId and scheduledType.
-		//     scheduledType=="personalRoomMeeting" → route to personal-room regardless.
-		//  2. roomId from the transcript item (fallback when meetings API fails).
-		//  3. Title match against the user's room list (last resort).
-		var spaceName, spaceType, resolvedRoomID string
-		var members []RoomMember
-		var endTime time.Time
-		var hostDisplayName, hostEmail, agenda string
+// downloadSingleTranscript fetches the VTT content, AI summary, and all
+// metadata for a single transcript item. n and total are used for the progress
+// line. Returns (zero, false) when the VTT content cannot be downloaded.
+func downloadSingleTranscript(client *WebexClient, item transcriptItem, n, total int) (Transcript, bool) {
+	startTime, _ := time.Parse(time.RFC3339, item.StartTime)
+	fmt.Printf("  [%d/%d] fetching (new) %s (%s)\n", n, total, item.MeetingTopic, startTime.Format("Jan 2, 2006"))
+	content, err := downloadTranscript(client, item.ID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "        warning: skipping — %v\n", err)
+		return Transcript{}, false
+	}
+	summary, summaryParticipants, err := fetchMeetingSummary(client, item.MeetingID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "        note: no AI summary available — %v\n", err)
+	}
+	var spaceName, spaceType, resolvedRoomID string
+	var members []RoomMember
+	var endTime time.Time
+	var hostDisplayName, hostEmail, agenda string
 
-		resolvedRoomID = item.RoomID
-		skipTitleMatch := false
+	resolvedRoomID = item.RoomID
+	skipTitleMatch := false
+	var detailsTitle string
 
-		if details, err := client.fetchMeetingDetails(item.MeetingID); err == nil {
-			hostDisplayName = details.HostDisplayName
-			hostEmail = details.HostEmail
-			agenda = details.Agenda
-			if t, err := time.Parse(time.RFC3339, details.End); err == nil {
-				endTime = t
-			}
-			if details.ScheduledType == "personalRoomMeeting" || isPersonalRoomTitle(item.MeetingTopic) {
-				resolvedRoomID = ""
-				skipTitleMatch = true
-				if t := icsTitleForMeeting(startTime); t != "" {
-					item.MeetingTopic = t
-					fmt.Fprintf(os.Stderr, "        note: personal room — title from Outlook ICS: %q\n", t)
-				}
-			} else if details.RoomID != "" {
-				resolvedRoomID = details.RoomID
-				skipTitleMatch = true
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "        note: meeting details lookup failed for %s — %v\n", item.MeetingID, err)
+	if details, err := client.fetchMeetingDetails(item.MeetingID); err == nil {
+		hostDisplayName = details.HostDisplayName
+		hostEmail = details.HostEmail
+		agenda = details.Agenda
+		detailsTitle = details.Title
+		fmt.Fprintf(os.Stderr, "        note: meeting-api: scheduledType=%q title=%q roomID=%q\n", details.ScheduledType, details.Title, details.RoomID)
+		if t, err := time.Parse(time.RFC3339, details.End); err == nil {
+			endTime = t
 		}
-
-		if resolvedRoomID != "" {
-			if info, err := client.fetchRoomInfo(resolvedRoomID); err == nil {
-				spaceName = info.Title
-				spaceType = info.Type
-			} else {
-				fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", resolvedRoomID, err)
-			}
-		} else if !skipTitleMatch {
-			if allRooms, err := client.fetchAllRooms(); err == nil {
-				key := strings.ToLower(item.MeetingTopic)
-				if matched, ok := allRooms[key]; ok {
-					resolvedRoomID = matched.ID
-					spaceName = matched.Title
-					spaceType = matched.Type
-					fmt.Fprintf(os.Stderr, "        note: matched %q to Space %q (type=%s) via title lookup\n", item.MeetingTopic, matched.Title, matched.Type)
-				}
-			}
-		}
-
-		if resolvedRoomID != "" {
-			if m, err := client.fetchRoomMembers(resolvedRoomID); err == nil {
-				members = m
-			} else {
-				fmt.Fprintf(os.Stderr, "        note: could not fetch room members — %v\n", err)
-			}
-		}
-
-		participants, err := client.fetchMeetingParticipants(item.MeetingID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "        note: could not fetch participants — %v\n", err)
-		}
-		if len(participants) == 0 {
-			participants = parseTranscriptSpeakers(content)
-			if len(participants) > 0 {
-				fmt.Fprintf(os.Stderr, "        note: participant API empty — extracted %d speakers from transcript\n", len(participants))
-			}
-		}
-		// Always merge summary attendees — catches people who attended but didn't speak.
-		if len(summaryParticipants) > 0 {
-			before := len(participants)
-			participants = mergeParticipants(participants, summaryParticipants)
-			if added := len(participants) - before; added > 0 {
-				fmt.Fprintf(os.Stderr, "        note: added %d silent attendee(s) from AI summary\n", added)
-			}
-		}
-
-		// Secondary ICS fallback: if the topic still looks like a personal
-		// room (API may not return scheduledType for older meetings), try ICS.
-		if isPersonalRoomTitle(item.MeetingTopic) {
+		if details.ScheduledType == "personalRoomMeeting" || isPersonalRoomTitle(item.MeetingTopic) {
+			resolvedRoomID = ""
+			skipTitleMatch = true
 			if t := icsTitleForMeeting(startTime); t != "" {
 				item.MeetingTopic = t
 				fmt.Fprintf(os.Stderr, "        note: personal room — title from Outlook ICS: %q\n", t)
+			} else if details.Title != "" && !isPersonalRoomTitle(details.Title) {
+				item.MeetingTopic = details.Title
+				fmt.Fprintf(os.Stderr, "        note: personal room — title from Webex API: %q\n", details.Title)
+			} else {
+				fmt.Fprintf(os.Stderr, "        note: personal room — ICS lookup found no match for %s (no calendar invite synced)\n", startTime.UTC().Format("2006-01-02 15:04 UTC"))
+			}
+		} else if details.RoomID != "" {
+			resolvedRoomID = details.RoomID
+			skipTitleMatch = true
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "        note: meeting details lookup failed for %s — %v\n", item.MeetingID, err)
+	}
+
+	if resolvedRoomID != "" {
+		if info, err := client.fetchRoomInfo(resolvedRoomID); err == nil {
+			spaceName = info.Title
+			spaceType = info.Type
+		} else {
+			fmt.Fprintf(os.Stderr, "        note: room name lookup failed for %s — using meeting topic as folder name (%v)\n", resolvedRoomID, err)
+		}
+	} else if !skipTitleMatch {
+		if allRooms, err := client.fetchAllRooms(); err == nil {
+			key := strings.ToLower(item.MeetingTopic)
+			if matched, ok := allRooms[key]; ok {
+				resolvedRoomID = matched.ID
+				spaceName = matched.Title
+				spaceType = matched.Type
+				fmt.Fprintf(os.Stderr, "        note: matched %q to Space %q (type=%s) via title lookup\n", item.MeetingTopic, matched.Title, matched.Type)
+				if matched.Type == "direct" {
+					if t := icsTitleForMeeting(startTime); t != "" {
+						item.MeetingTopic = t
+						spaceName = ""
+						spaceType = ""
+						resolvedRoomID = ""
+						fmt.Fprintf(os.Stderr, "        note: direct space via title match — title from Outlook ICS: %q\n", t)
+					} else {
+						fmt.Fprintf(os.Stderr, "        note: direct space via title match — ICS lookup found no match for %s\n", startTime.UTC().Format("2006-01-02 15:04 UTC"))
+						if detailsTitle != "" && !isPersonalRoomTitle(detailsTitle) && !strings.EqualFold(detailsTitle, matched.Title) {
+							item.MeetingTopic = detailsTitle
+							spaceName = ""
+							spaceType = ""
+							resolvedRoomID = ""
+							fmt.Fprintf(os.Stderr, "        note: direct space via title match — title from Webex API: %q\n", detailsTitle)
+						} else if detailsTitle != "" {
+							fmt.Fprintf(os.Stderr, "        note: direct space via title match — Webex API title %q same as space name, no better title available\n", detailsTitle)
+						}
+					}
+				}
 			}
 		}
+	}
 
-		transcripts = append(transcripts, Transcript{
-			ID:              item.ID,
-			MeetingID:       item.MeetingID,
-			MeetingTitle:    item.MeetingTopic,
-			SpaceName:       spaceName,
-			SpaceType:       spaceType,
-			RoomID:          resolvedRoomID,
-			StartTime:       startTime,
-			EndTime:         endTime,
-			HostDisplayName: hostDisplayName,
-			HostEmail:       hostEmail,
-			Agenda:          agenda,
-			Content:         content,
-			AISummary:       summary,
-			RoomMembers:     members,
-			Participants:    participants,
-		})
+	if resolvedRoomID != "" {
+		if m, err := client.fetchRoomMembers(resolvedRoomID); err == nil {
+			members = m
+		} else {
+			fmt.Fprintf(os.Stderr, "        note: could not fetch room members — %v\n", err)
+		}
+	}
+
+	participants, err := client.fetchMeetingParticipants(item.MeetingID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "        note: could not fetch participants — %v\n", err)
+	}
+	vttSpeakers := parseTranscriptSpeakers(content)
+	if len(participants) == 0 {
+		participants = vttSpeakers
+		if len(participants) > 0 {
+			fmt.Fprintf(os.Stderr, "        note: participant API empty — extracted %d speakers from transcript\n", len(participants))
+		}
+	} else {
+		before := len(participants)
+		participants = mergeParticipants(participants, vttSpeakers)
+		if added := len(participants) - before; added > 0 {
+			fmt.Fprintf(os.Stderr, "        note: added %d speaker(s) from transcript not in participants API\n", added)
+		}
+	}
+	if len(summaryParticipants) > 0 {
+		before := len(participants)
+		participants = mergeParticipants(participants, summaryParticipants)
+		if added := len(participants) - before; added > 0 {
+			fmt.Fprintf(os.Stderr, "        note: added %d silent attendee(s) from AI summary\n", added)
+		}
+	}
+
+	if isPersonalRoomTitle(item.MeetingTopic) {
+		if t := icsTitleForMeeting(startTime); t != "" {
+			item.MeetingTopic = t
+			fmt.Fprintf(os.Stderr, "        note: personal room — title from Outlook ICS: %q\n", t)
+		}
+	}
+
+	return Transcript{
+		ID:              item.ID,
+		MeetingID:       item.MeetingID,
+		MeetingTitle:    item.MeetingTopic,
+		SpaceName:       spaceName,
+		SpaceType:       spaceType,
+		RoomID:          resolvedRoomID,
+		StartTime:       startTime,
+		EndTime:         endTime,
+		HostDisplayName: hostDisplayName,
+		HostEmail:       hostEmail,
+		Agenda:          agenda,
+		Content:         content,
+		AISummary:       summary,
+		RoomMembers:     members,
+		Participants:    participants,
+	}, true
+}
+
+// downloadTranscriptItems fetches VTT content and metadata for each item and
+// returns the fully populated Transcript slice. Items whose content cannot be
+// downloaded are logged as warnings and omitted from the result.
+func downloadTranscriptItems(client *WebexClient, items []transcriptItem) []Transcript {
+	var transcripts []Transcript
+	for i, item := range items {
+		t, ok := downloadSingleTranscript(client, item, i+1, len(items))
+		if !ok {
+			continue
+		}
+		transcripts = append(transcripts, t)
 	}
 	return transcripts
 }
@@ -690,6 +732,13 @@ func mergeParticipants(base, extra []MeetingParticipant) []MeetingParticipant {
 	return out
 }
 
+// CurrentUserDisplayName returns the display name of the authenticated user.
+// Shares the same lazy /people/me call as CurrentUserEmail.
+func (c *WebexClient) CurrentUserDisplayName() string {
+	c.CurrentUserEmail() // ensures the once block has run
+	return c.currentUserDisplayName
+}
+
 // CurrentUserEmail returns the email address of the authenticated Webex user
 // via GET /people/me. The result is cached after the first call. Returns an
 // empty string on error so callers can treat it as a soft dependency.
@@ -704,7 +753,8 @@ func (c *WebexClient) CurrentUserEmail() string {
 			return
 		}
 		var me struct {
-			Emails []string `json:"emails"`
+			Emails      []string `json:"emails"`
+			DisplayName string   `json:"displayName"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
 			return
@@ -712,6 +762,7 @@ func (c *WebexClient) CurrentUserEmail() string {
 		if len(me.Emails) > 0 {
 			c.currentUserEmail = strings.ToLower(me.Emails[0])
 		}
+		c.currentUserDisplayName = me.DisplayName
 	})
 	return c.currentUserEmail
 }

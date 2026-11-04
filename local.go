@@ -66,6 +66,15 @@ func titleIs1on1(title string, participants []MeetingParticipant) bool {
 	return false
 }
 
+func containsDigit(s string) bool {
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
 // deduplicateParticipants returns a slice with one entry per unique email.
 // Webex logs each join/rejoin as a separate participant entry, so the same
 // person can appear multiple times. The first occurrence is kept.
@@ -86,51 +95,158 @@ func deduplicateParticipants(participants []MeetingParticipant) []MeetingPartici
 	return out
 }
 
+// selfTokens returns lower-cased name tokens (≥3 chars) for the current user's
+// display name. Used to identify self in participant lists and title checks.
+func selfTokens(currentUserDisplayName string) []string {
+	var out []string
+	for _, tok := range strings.Fields(strings.ToLower(currentUserDisplayName)) {
+		if len(tok) >= 3 {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// findSelf returns the index in unique of the current user, or -1.
+// Email match is tried first; falls back to exact display-name token match.
+func findSelf(unique []MeetingParticipant, currentUserEmail string, selfToks []string) int {
+	for i, p := range unique {
+		if currentUserEmail != "" && strings.EqualFold(p.Email, currentUserEmail) {
+			return i
+		}
+	}
+	for i, p := range unique {
+		for _, pTok := range strings.Fields(strings.ToLower(p.DisplayName)) {
+			for _, sTok := range selfToks {
+				if pTok == sTok {
+					return i
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// titleHasParticipantName reports whether lower contains any name token (≥3 chars)
+// from any of the given participants.
+func titleHasParticipantName(lower string, participants []MeetingParticipant) bool {
+	for _, p := range participants {
+		for _, tok := range strings.Fields(strings.ToLower(p.DisplayName)) {
+			if len(tok) >= 3 && strings.Contains(lower, tok) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // classifyMeeting applies the /sf:meeting-notes classification rules:
+//
 //  1. spaceType == "direct" → 1:1 (Webex direct space is always a 1:1).
 //  2. Title contains 1:1/1-1/one-on-one keyword → 1:1 (unconditional).
-//  3. Exactly 2 unique participants (one is currentUserEmail) AND the other
-//     person's name appears in the title → 1:1.
-//  4. Title appears 2+ times in the calendar DB → recurring.
-//  5. Everything else → standalone.
+//  3. PRIMARY: exactly 2 unique attendees, one is the current user, AND the
+//     title contains a name token from at least one attendee → 1:1.
+//  4. FALLBACK for inflated participant lists (API + VTT noise): title matches a
+//     1:1 name pattern (colon / slash / auto-generated "X and Y's meeting") AND
+//     a participant name or the current user's name validates it → 1:1.
+//  5. Title appears 2+ times in the calendar DB → recurring.
+//  6. Everything else → standalone.
 //
-// Participants are deduplicated by email before counting so that rejoins
-// (Webex logs each join as a separate entry) don't inflate the count.
-// participants, currentUserEmail, and spaceType are optional — pass nil/"" when unavailable.
-func classifyMeeting(title string, cf *calendarFile, participants []MeetingParticipant, currentUserEmail, spaceType string) MeetingCategory {
-	// Direct Webex space = definitively a 1:1.
-	if strings.EqualFold(spaceType, "direct") {
+// Participants are deduplicated by email before counting so that rejoins do not
+// inflate the count. All arguments are optional — pass nil/"" when unavailable.
+func classifyMeeting(title string, cf *calendarFile, participants []MeetingParticipant, currentUserEmail, currentUserDisplayName, spaceType string) MeetingCategory {
+	unique := deduplicateParticipants(participants)
+	lower := strings.ToLower(title)
+
+	// 1. Direct Webex space — strong signal, but cap at ≤2 speakers to guard
+	// against title-lookup false positives that bring in unrelated meetings.
+	if strings.EqualFold(spaceType, "direct") && (len(unique) == 0 || len(unique) <= 2) {
 		return Category1on1
 	}
 
-	// Title keywords are an unconditional signal — check before participant count.
-	lower := strings.ToLower(title)
+	// 2. Explicit 1:1 keywords in the title.
 	if strings.Contains(lower, "1:1") || strings.Contains(lower, "1-1") ||
 		strings.Contains(lower, "one on one") || strings.Contains(lower, "one-on-one") {
 		return Category1on1
 	}
 
-	// Deduplicate participants by email (rejoins create duplicate entries).
-	unique := deduplicateParticipants(participants)
+	sToks := selfTokens(currentUserDisplayName)
+	titleHasSelf := func() bool {
+		for _, tok := range sToks {
+			if strings.Contains(lower, tok) {
+				return true
+			}
+		}
+		return false
+	}
 
-	if len(unique) == 2 && currentUserEmail != "" {
-		// 2-person meeting: require current user is one, then check if the
-		// OTHER person's name appears in the title.
-		for _, p := range unique {
-			if strings.EqualFold(p.Email, currentUserEmail) {
-				var others []MeetingParticipant
-				for _, o := range unique {
-					if !strings.EqualFold(o.Email, currentUserEmail) {
-						others = append(others, o)
+	// 3. PRIMARY: exactly 2 unique attendees, one is the current user, title
+	// confirms with any attendee name. This is the ground-truth signal.
+	if len(unique) == 2 {
+		if findSelf(unique, currentUserEmail, sToks) >= 0 && titleHasParticipantName(lower, unique) {
+			return Category1on1
+		}
+	}
+
+	// 4. FALLBACK: title patterns handle inflated participant lists caused by the
+	// participants API returning the host AND the VTT adding extra speakers.
+	// Each pattern fires when a participant name validates it, OR when the title
+	// contains the current user's own name (e.g. "Gabe:Sherif Sync").
+
+	// 4a. Colon pattern: "Name:Sherif Sync", "Tong:Sherif Sync"
+	if idx := strings.Index(lower, ":"); idx >= 3 && idx <= 15 {
+		before := lower[:idx]
+		if !strings.Contains(before, " ") && !containsDigit(before) {
+			for _, p := range unique {
+				for _, tok := range strings.Fields(strings.ToLower(p.DisplayName)) {
+					if len(tok) >= 3 && tok == before {
+						return Category1on1
 					}
 				}
-				if titleIs1on1(title, others) {
-					return Category1on1
-				}
-				break
+			}
+			if titleHasSelf() {
+				return Category1on1
 			}
 		}
 	}
+
+	// 4b. Slash pattern: "Sheriff/Mindy", "Sherif/Damien"
+	if idx := strings.Index(lower, "/"); idx >= 3 && idx <= 15 {
+		before := lower[:idx]
+		after := strings.Fields(lower[idx+1:])
+		if !strings.Contains(before, " ") && !containsDigit(before) &&
+			len(after) > 0 && len(after[0]) >= 3 && !containsDigit(after[0]) {
+			for _, p := range unique {
+				for _, tok := range strings.Fields(strings.ToLower(p.DisplayName)) {
+					if len(tok) >= 3 && (tok == before || tok == after[0]) {
+						return Category1on1
+					}
+				}
+			}
+			if titleHasSelf() {
+				return Category1on1
+			}
+		}
+	}
+
+	// 4c. Webex auto-generated "'s meeting": "PersonA and PersonB's meeting"
+	if strings.HasSuffix(lower, "'s meeting") {
+		if andIdx := strings.Index(lower, " and "); andIdx >= 0 {
+			afterAnd := lower[andIdx+5:]
+			if titleHasSelf() {
+				return Category1on1
+			}
+			for _, p := range unique {
+				for _, tok := range strings.Fields(strings.ToLower(p.DisplayName)) {
+					if len(tok) >= 4 && strings.HasPrefix(afterAnd, tok) {
+						return Category1on1
+					}
+				}
+			}
+		}
+	}
+
+	// 5. Calendar recurring check.
 	if cf != nil {
 		count := 0
 		for _, entries := range cf.Meetings {
@@ -145,6 +261,29 @@ func classifyMeeting(title string, cf *calendarFile, participants []MeetingParti
 		}
 	}
 	return CategoryOneOff
+}
+
+// classifyMeetingFull runs classifyMeeting and then falls back to icsCountTitle
+// when the result is standalone and the calendar DB has fewer than 2 entries.
+// This handles personal room meetings whose titles were resolved at fetch time
+// and therefore may not yet appear in the calendar DB.
+func classifyMeetingFull(title string, cf *calendarFile, participants []MeetingParticipant, currentUserEmail, currentUserDisplayName, spaceType string) (MeetingCategory, int) {
+	cat := classifyMeeting(title, cf, participants, currentUserEmail, currentUserDisplayName, spaceType)
+	n := countOccurrences(title, cf)
+	if cat == CategoryOneOff && n < 2 {
+		icsN := icsCountTitle(title)
+		fmt.Fprintf(os.Stderr, "  [classify-debug] %q: calDB=%d icsCount=%d\n", title, n, icsN)
+		if icsN >= 2 {
+			return CategoryRecurring, icsN
+		}
+		// An unresolved personal room title means ICS had no match for that
+		// specific time slot, but the personal room itself is used repeatedly.
+		// Defaulting to recurring is more accurate than standalone.
+		if isPersonalRoomTitle(title) {
+			return CategoryRecurring, n
+		}
+	}
+	return cat, n
 }
 
 // countOccurrences returns how many times title appears across all dates in cf.
@@ -187,6 +326,7 @@ type localEntry struct {
 	HostDisplayName string               `json:"hostDisplayName,omitempty"`
 	HostEmail       string               `json:"hostEmail,omitempty"`
 	SpaceName       string               `json:"spaceName,omitempty"`
+	SpaceType       string               `json:"spaceType,omitempty"`
 	Participants    []MeetingParticipant `json:"participants,omitempty"`
 	TranscriptPath  string               `json:"transcriptPath"`
 	InfoPath        string               `json:"infoPath,omitempty"`
@@ -198,16 +338,68 @@ type localEntry struct {
 //
 //	outputDir/webex-meetings/<category>/<space-or-meeting-title>/<YYYY-MM-DD>-<HHmm>-summary.md (when present)
 //
+// peerDisplayName returns the display name of the other participant in a 1:1.
+// It excludes the current user by email first, then by display name tokens.
+// Returns "" when the peer cannot be determined.
+func peerDisplayName(participants []MeetingParticipant, currentUserEmail, currentUserDisplayName string) string {
+	unique := deduplicateParticipants(participants)
+	if len(unique) < 2 {
+		return ""
+	}
+	// Build a set of current-user name tokens for fallback matching.
+	selfTokens := make(map[string]bool)
+	for _, tok := range strings.Fields(strings.ToLower(currentUserDisplayName)) {
+		if len(tok) >= 3 {
+			selfTokens[tok] = true
+		}
+	}
+	for _, p := range unique {
+		// Skip by email.
+		if currentUserEmail != "" && strings.EqualFold(p.Email, currentUserEmail) {
+			continue
+		}
+		// Skip by display name when emails are empty.
+		if p.Email == "" && currentUserDisplayName != "" {
+			isSelf := false
+			for _, tok := range strings.Fields(strings.ToLower(p.DisplayName)) {
+				if selfTokens[tok] {
+					isSelf = true
+					break
+				}
+			}
+			if isSelf {
+				continue
+			}
+		}
+		if strings.TrimSpace(p.DisplayName) != "" {
+			return p.DisplayName
+		}
+	}
+	return ""
+}
+
 // <category> is one of "1-1s", "recurring", or "standalone" derived from t.Category.
 // The start time (HHmm in ET, 24h) is always included in the filename so that
 // multiple meetings in the same space on the same day never collide.
 // t.Category must be set before calling; zero value routes to "standalone".
+// currentUserEmail and currentUserDisplayName are used to normalise 1:1 folder names.
 //
 // Returns the path of the transcript file.
-func writeTranscriptLocally(outputDir string, t Transcript) (string, error) {
+func writeTranscriptLocally(outputDir string, t Transcript, currentUserEmail, currentUserDisplayName string) (string, error) {
 	label := t.SpaceName
 	if label == "" {
 		label = t.MeetingTitle
+	}
+	if t.Category == Category1on1 {
+		if peer := peerDisplayName(t.Participants, currentUserEmail, currentUserDisplayName); peer != "" {
+			if currentUserDisplayName != "" {
+				label = peer + " : " + currentUserDisplayName
+			} else {
+				label = peer
+			}
+		}
+	} else if t.Category == CategoryOneOff {
+		label = t.StartTime.In(eastern).Format("2006-01-02") + "-" + label
 	}
 	dir := filepath.Join(outputDir, "webex-meetings", t.Category.DriveFolder(), sanitizeFilename(label))
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -361,6 +553,40 @@ func transcriptsToScheduledMeetings(transcripts []Transcript) []ScheduledMeeting
 	return meetings
 }
 
+// itemsToScheduledMeetings converts transcript list metadata (no VTT content)
+// to ScheduledMeetings so the calendar DB can be pre-populated for recurring
+// detection before any content is downloaded.
+func itemsToScheduledMeetings(items []transcriptItem) []ScheduledMeeting {
+	meetings := make([]ScheduledMeeting, 0, len(items))
+	for _, item := range items {
+		start, _ := time.Parse(time.RFC3339, item.StartTime)
+		meetings = append(meetings, ScheduledMeeting{
+			ID:    item.MeetingID,
+			Title: item.MeetingTopic,
+			Start: start,
+		})
+	}
+	return meetings
+}
+
+// readTranscriptFiles reads the content and AI summary from disk files written
+// by writeTranscriptLocally. The summary file path is derived from transcriptPath
+// by replacing the transcript.md suffix. Returns empty strings on any error.
+func readTranscriptFiles(transcriptPath string) (content, summary string) {
+	if data, err := os.ReadFile(transcriptPath); err == nil {
+		if parts := strings.SplitN(string(data), "\n---\n\n", 2); len(parts) == 2 {
+			content = parts[1]
+		}
+	}
+	summaryPath := strings.TrimSuffix(transcriptPath, "transcript.md") + "summary.md"
+	if data, err := os.ReadFile(summaryPath); err == nil {
+		if parts := strings.SplitN(string(data), "\n---\n\n", 2); len(parts) == 2 {
+			summary = parts[1]
+		}
+	}
+	return
+}
+
 // sanitizeFilename replaces characters that are unsafe in file/directory names.
 func sanitizeFilename(s string) string {
 	r := strings.NewReplacer(
@@ -423,6 +649,58 @@ func icsTitleForMeeting(start time.Time) string {
 	return ""
 }
 
+// icsCountTitle counts how many ICS events across all available months in
+// ~/mail-cal-sync/calendar/ have a SUMMARY exactly matching title
+// (case-insensitive). Returns early once count reaches 2 since callers only
+// need to distinguish "once" from "recurring". Returns 0 if mail-cal-sync is
+// absent or no matches are found.
+func icsCountTitle(title string) int {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0
+	}
+	calBase := filepath.Join(home, "mail-cal-sync", "calendar")
+	if _, err := os.Stat(calBase); err != nil {
+		return 0
+	}
+	lowerTitle := strings.ToLower(title)
+	skipCals := map[string]bool{
+		"united_states_holidays": true,
+		"us_holidays":            true,
+	}
+	unescaper := strings.NewReplacer(`\,`, ",", `\;`, ";", `\n`, " ", `\\`, `\`)
+	count := 0
+	_ = filepath.WalkDir(calBase, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".ics") {
+			return nil
+		}
+		// Skip holiday calendars by directory name.
+		parts := strings.Split(filepath.ToSlash(path), "/")
+		for _, p := range parts {
+			if skipCals[strings.ToLower(p)] {
+				return nil
+			}
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		m := icsSummaryRe.FindSubmatch(data)
+		if m == nil {
+			return nil
+		}
+		summary := unescaper.Replace(strings.TrimSpace(string(m[1])))
+		if strings.ToLower(summary) == lowerTitle {
+			count++
+			if count >= 2 {
+				return filepath.SkipAll // found enough — stop early
+			}
+		}
+		return nil
+	})
+	return count
+}
+
 // icsParseTitle returns the SUMMARY of an ICS file if its DTSTART is within
 // ±30 minutes of target, otherwise ("", false).
 func icsParseTitle(path string, target time.Time) (string, bool) {
@@ -442,7 +720,15 @@ func icsParseTitle(path string, target time.Time) (string, bool) {
 	var t time.Time
 	for _, layout := range []string{"20060102T150405Z", "20060102T150405", "20060102"} {
 		if parsed, err2 := time.Parse(layout, raw); err2 == nil {
-			t = parsed.UTC()
+			if strings.HasSuffix(raw, "Z") {
+				// Explicit UTC timestamp.
+				t = parsed.UTC()
+			} else {
+				// No timezone indicator — Outlook exports local time without Z.
+				// Interpret as Eastern (the user's timezone) and convert to UTC.
+				t = time.Date(parsed.Year(), parsed.Month(), parsed.Day(),
+					parsed.Hour(), parsed.Minute(), parsed.Second(), 0, eastern).UTC()
+			}
 			break
 		}
 	}

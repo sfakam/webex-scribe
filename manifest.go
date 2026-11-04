@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
 	host_name        TEXT NOT NULL DEFAULT '',
 	host_email       TEXT NOT NULL DEFAULT '',
 	space_name       TEXT NOT NULL DEFAULT '',
+	space_type       TEXT NOT NULL DEFAULT '',
 	participant_count INTEGER NOT NULL DEFAULT 0,
 	transcript_path  TEXT NOT NULL DEFAULT '',
 	info_path        TEXT NOT NULL DEFAULT '',
@@ -95,6 +96,8 @@ func loadLocalManifest(outputDir string) *localManifest {
 	if _, err := db.Exec(dbSchema); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not initialise schema: %v\n", err)
 	}
+	// Add space_type column to existing DBs that predate it.
+	db.Exec("ALTER TABLE transcripts ADD COLUMN space_type TEXT NOT NULL DEFAULT ''")
 
 	lm := &localManifest{db: db}
 
@@ -133,11 +136,11 @@ func (lm *localManifest) record(id string, e localEntry) error {
 	_, err = tx.Exec(`INSERT OR REPLACE INTO transcripts
 		(transcript_id, meeting_id, title, category, meeting_date,
 		 start_time, end_time, duration_minutes, host_name, host_email,
-		 space_name, participant_count, transcript_path, info_path, written_at)
-		VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?)`,
+		 space_name, space_type, participant_count, transcript_path, info_path, written_at)
+		VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?)`,
 		id, e.MeetingID, e.Title, e.Category, e.MeetingDate,
 		e.StartTime, e.EndTime, e.DurationMinutes, e.HostDisplayName, e.HostEmail,
-		e.SpaceName, len(e.Participants), e.TranscriptPath, e.InfoPath,
+		e.SpaceName, e.SpaceType, len(e.Participants), e.TranscriptPath, e.InfoPath,
 		e.WrittenAt.UTC().Format(time.RFC3339),
 	)
 	if err != nil {
@@ -269,6 +272,79 @@ func (lm *localManifest) close() {
 	if lm.db != nil {
 		lm.db.Close()
 	}
+}
+
+// loadForUpload reconstructs a Transcript from the local DB and local files.
+// Returns (nil, false) when the entry is not found or the transcript file is
+// missing on disk. Intended for Drive mode: when the Drive manifest is empty
+// (e.g. the Drive folder was deleted) but the local DB already has the
+// transcript, upload from the local file instead of re-fetching from Webex.
+func (lm *localManifest) loadForUpload(id string) (*Transcript, bool) {
+	var (
+		meetingID, title, category, startStr, endStr string
+		hostName, hostEmail, spaceName, spaceType, transcriptPath string
+	)
+	err := lm.db.QueryRow(`
+		SELECT meeting_id, title, category, start_time, end_time,
+		       host_name, host_email, space_name, space_type, transcript_path
+		FROM transcripts WHERE transcript_id = ?`, id).Scan(
+		&meetingID, &title, &category, &startStr, &endStr,
+		&hostName, &hostEmail, &spaceName, &spaceType, &transcriptPath,
+	)
+	if err != nil {
+		return nil, false
+	}
+
+	// Verify the file exists; createMeetingDocs will read content from disk at upload time.
+	if _, err := os.Stat(transcriptPath); err != nil {
+		return nil, false // file missing on this machine — caller falls back to Webex
+	}
+
+	startTime, _ := time.Parse(time.RFC3339, startStr)
+	var endTime time.Time
+	if endStr != "" {
+		endTime, _ = time.Parse(time.RFC3339, endStr)
+	}
+
+	rows, _ := lm.db.Query(`SELECT display_name, email, is_host FROM participants WHERE transcript_id = ?`, id)
+	var participants []MeetingParticipant
+	if rows != nil {
+		for rows.Next() {
+			var p MeetingParticipant
+			var isHost int
+			rows.Scan(&p.DisplayName, &p.Email, &isHost)
+			p.IsHost = isHost == 1
+			participants = append(participants, p)
+		}
+		rows.Close()
+	}
+
+	var cat MeetingCategory
+	switch category {
+	case "1:1":
+		cat = Category1on1
+	case "recurring":
+		cat = CategoryRecurring
+	default:
+		cat = CategoryOneOff
+	}
+
+	return &Transcript{
+		ID:              id,
+		MeetingID:       meetingID,
+		MeetingTitle:    title,
+		SpaceName:       spaceName,
+		SpaceType:       spaceType,
+		StartTime:       startTime,
+		EndTime:         endTime,
+		HostDisplayName: hostName,
+		HostEmail:       hostEmail,
+		LocalPath:       transcriptPath,
+		LocalFolderName: filepath.Base(filepath.Dir(transcriptPath)),
+		Category:        cat,
+		Participants:    participants,
+		PreClassified:   true,
+	}, true
 }
 
 // migrateFromJSON imports all entries from the legacy JSON manifest into SQLite,

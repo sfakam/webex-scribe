@@ -373,11 +373,12 @@ func gcloudAccessToken() (string, error) {
 //
 // It returns the URLs of the Transcript doc and the Summary doc. summaryURL is
 // empty when no AI summary was available.
-func createMeetingDocs(ctx context.Context, clients *googleClients, rootFolderID string, t Transcript) (transcriptURL, summaryURL string, err error) {
-	// Use Space name as folder label when available, fall back to meeting topic.
-	folderLabel := t.MeetingTitle
-	if t.SpaceName != "" {
-		folderLabel = t.SpaceName
+func createMeetingDocs(ctx context.Context, clients *googleClients, rootFolderID string, t Transcript, folderLabel string) (transcriptURL, summaryURL string, err error) {
+	// folderLabel is pre-computed by the caller from the local filesystem path,
+	// so it already has the correct normalized name (peer-based for 1:1, date-
+	// prefixed for standalones). Fall back to MeetingTitle only as a safety net.
+	if folderLabel == "" {
+		folderLabel = t.MeetingTitle
 	}
 
 	// Ensure a per-series folder.
@@ -386,19 +387,25 @@ func createMeetingDocs(ctx context.Context, clients *googleClients, rootFolderID
 		return "", "", fmt.Errorf("ensuring series folder %q: %w", folderLabel, err)
 	}
 
-	dateStr := t.StartTime.Format("Jan 2, 2006")
+	dateStr := t.StartTime.In(eastern).Format("2006-01-02 15:04")
+
+	// Read content from local disk files; fall back to in-memory fields (bot mode).
+	content, aiSummary := t.Content, t.AISummary
+	if t.LocalPath != "" {
+		content, aiSummary = readTranscriptFiles(t.LocalPath)
+	}
 
 	// Create the Transcript doc titled "<label> — <date> — Transcript".
 	transcriptTitle := fmt.Sprintf("%s — %s — Transcript", folderLabel, dateStr)
-	transcriptURL, err = createDocInFolder(ctx, clients, seriesFolderID, transcriptTitle, "Transcript", t.Content)
+	transcriptURL, err = createDocInFolder(ctx, clients, seriesFolderID, transcriptTitle, "Transcript", content)
 	if err != nil {
 		return "", "", fmt.Errorf("creating transcript doc: %w", err)
 	}
 
 	// Create the Summary doc only when an AI summary was fetched.
-	if t.AISummary != "" {
+	if aiSummary != "" {
 		summaryTitle := fmt.Sprintf("%s — %s — Summary", folderLabel, dateStr)
-		summaryURL, err = createDocInFolder(ctx, clients, seriesFolderID, summaryTitle, "AI Summary", t.AISummary)
+		summaryURL, err = createDocInFolder(ctx, clients, seriesFolderID, summaryTitle, "AI Summary", aiSummary)
 		if err != nil {
 			return "", "", fmt.Errorf("creating summary doc: %w", err)
 		}
@@ -411,7 +418,67 @@ func createMeetingDocs(ctx context.Context, clients *googleClients, rootFolderID
 		}
 	}
 
+	// Upload meeting-info.json alongside the docs.
+	infoFileName := fmt.Sprintf("%s — %s — Meeting Info.json", folderLabel, dateStr)
+	if err := uploadMeetingInfoToFolder(ctx, clients, seriesFolderID, infoFileName, t); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not upload meeting-info.json: %v\n", err)
+	}
+
 	return transcriptURL, summaryURL, nil
+}
+
+// uploadMeetingInfoToFolder uploads a meeting-info.json file to folderID.
+// Idempotent: skips the upload when a file with the same name already exists.
+func uploadMeetingInfoToFolder(ctx context.Context, clients *googleClients, folderID, fileName string, t Transcript) error {
+	info := meetingInfoJSON{
+		ID:              t.ID,
+		MeetingID:       t.MeetingID,
+		Title:           t.MeetingTitle,
+		Category:        t.Category.String(),
+		OccurrenceCount: t.OccurrenceCount,
+		StartTime:       t.StartTime.UTC().Format(time.RFC3339),
+		HostDisplayName: t.HostDisplayName,
+		HostEmail:       t.HostEmail,
+		Agenda:          t.Agenda,
+		SpaceName:       t.SpaceName,
+		SpaceType:       t.SpaceType,
+		Participants:    t.Participants,
+	}
+	if !t.EndTime.IsZero() {
+		info.EndTime = t.EndTime.UTC().Format(time.RFC3339)
+		info.DurationMinutes = int(t.EndTime.Sub(t.StartTime).Minutes())
+	}
+	for _, m := range t.RoomMembers {
+		info.SpaceMembers = append(info.SpaceMembers, spaceMember{
+			DisplayName: m.DisplayName,
+			Email:       m.Email,
+			IsHost:      m.IsModerator,
+		})
+	}
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshalling meeting-info: %w", err)
+	}
+
+	// Skip if already present.
+	safeName := strings.ReplaceAll(fileName, "'", `\'`)
+	q := fmt.Sprintf("name='%s' and '%s' in parents and trashed=false", safeName, folderID)
+	list, err := clients.drive.Files.List().Q(q).Fields("files(id)").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("checking for existing meeting-info: %w", err)
+	}
+	if len(list.Files) > 0 {
+		return nil
+	}
+
+	return retryOnRateLimit(func() error {
+		_, err := clients.drive.Files.Create(&driveapi.File{
+			Name:     fileName,
+			Parents:  []string{folderID},
+			MimeType: "application/json",
+		}).Media(bytes.NewReader(data)).Context(ctx).Do()
+		return err
+	})
 }
 
 // createManifestIfMissing creates a "Members" Google Doc in folderID listing
@@ -543,16 +610,20 @@ func insertTextReq(index int64, text string) *docsapi.Request {
 
 // retryOnRateLimit calls fn and retries up to maxRetries times when the Docs
 // or Drive API responds with a rate-limit error (HTTP 429 or 403
-// rateLimitExceeded). The first retry waits 15 s; each subsequent wait doubles
-// (15 → 30 → 60 → 120 → 240 s) to give the per-minute quota window time to
-// reset without hammering the API.
+// rateLimitExceeded). When a rate-limit error occurs the first retry waits 30 s;
+// each subsequent wait doubles (30 → 60 → 120 → 240 s) to give the quota
+// window time to reset. Between retries a short gap is inserted.
 func retryOnRateLimit(fn func() error) error {
 	const (
-		maxRetries   = 6
-		initialWait  = 15 * time.Second
-		maxWait      = 240 * time.Second
+		maxRetries  = 6
+		attemptGap  = 1 * time.Second
+		initialWait = 30 * time.Second
+		maxWait     = 240 * time.Second
 	)
 	for attempt := range maxRetries {
+		if attempt > 0 {
+			time.Sleep(attemptGap)
+		}
 		err := fn()
 		if err == nil {
 			return nil
