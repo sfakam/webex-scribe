@@ -33,13 +33,13 @@ import (
 )
 
 const (
-	// rootFolderName is the top-level Google Drive folder that contains all
-	// year-month subfolders for personal transcripts.
-	rootFolderName = "webex-meetings"
-
 	// botRootFolderName is the top-level Drive folder used when running in
 	// bot mode (--bot), keeping bot-sourced transcripts separate.
 	botRootFolderName = "webex-meetings-bot"
+
+	// rootFolderBase is the prefix for the per-user root folder.
+	// The full name is built by rootFolderName().
+	rootFolderBase = "webex-meetings"
 
 	// driveFolderMIME is the MIME type that identifies a Google Drive folder.
 	driveFolderMIME = "application/vnd.google-apps.folder"
@@ -48,6 +48,17 @@ const (
 	// Chosen to avoid conflicts with common development servers.
 	googleCallbackPort = "47824"
 )
+
+// rootFolderName returns the per-user Drive root folder name, e.g.
+// "webex-meetings-sfathall". userEmail is the Webex account email; the
+// username part (before @) is appended. Falls back to rootFolderBase when
+// the email is empty or malformed.
+func rootFolderName(userEmail string) string {
+	if at := strings.Index(userEmail, "@"); at > 0 {
+		return rootFolderBase + "-" + userEmail[:at]
+	}
+	return rootFolderBase
+}
 
 // googleScopes are the OAuth2 scopes required by this tool.
 var googleScopes = []string{
@@ -300,6 +311,37 @@ func (c *googleClients) ensureFolderCached(ctx context.Context, name, parentID s
 // If a matching non-trashed folder already exists it is returned; otherwise a
 // new folder is created. When the same name exists more than once the first
 // result returned by the API is used.
+// migrateRootFolder renames an existing Drive folder from oldName to newName
+// under parentID (use "root" for the Drive root). It is a no-op when oldName
+// does not exist or newName already exists.
+func migrateRootFolder(ctx context.Context, svc *driveapi.Service, oldName, newName, parentID string) {
+	if oldName == newName {
+		return
+	}
+	// Check the new name doesn't already exist.
+	safeNew := strings.ReplaceAll(newName, "'", `\'`)
+	res, err := svc.Files.List().
+		Q(fmt.Sprintf("name='%s' and mimeType='%s' and '%s' in parents and trashed=false", safeNew, driveFolderMIME, parentID)).
+		Fields("files(id)").Context(ctx).Do()
+	if err != nil || len(res.Files) > 0 {
+		return // new folder already exists or search failed — let ensureFolder handle it
+	}
+	// Find the old folder.
+	safeOld := strings.ReplaceAll(oldName, "'", `\'`)
+	res, err = svc.Files.List().
+		Q(fmt.Sprintf("name='%s' and mimeType='%s' and '%s' in parents and trashed=false", safeOld, driveFolderMIME, parentID)).
+		Fields("files(id)").Context(ctx).Do()
+	if err != nil || len(res.Files) == 0 {
+		return // old folder doesn't exist — nothing to rename
+	}
+	oldID := res.Files[0].Id
+	if _, err := svc.Files.Update(oldID, &driveapi.File{Name: newName}).Context(ctx).Do(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not rename Drive folder %q → %q: %v\n", oldName, newName, err)
+		return
+	}
+	fmt.Printf("  Renamed Drive folder %q → %q\n", oldName, newName)
+}
+
 func ensureFolder(ctx context.Context, svc *driveapi.Service, name, parentID string) (string, error) {
 	// Drive query syntax uses single-quoted string literals; escape any
 	// literal single quotes in the name by replacing ' with \'.

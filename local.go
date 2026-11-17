@@ -616,8 +616,9 @@ func isPersonalRoomTitle(title string) bool {
 }
 
 // icsTitleForMeeting scans ~/mail-cal-sync/calendar for an Outlook ICS event
-// whose start time is within ±30 minutes of start. Returns the ICS SUMMARY
-// (meeting title) if found, or "" if mail-cal-sync is absent or no match.
+// whose start time is within ±20 minutes of start, returning the closest
+// match across all calendars. Returns the ICS SUMMARY (meeting title) if
+// found, or "" if mail-cal-sync is absent or no match.
 // Intended as a fallback for personal-room meetings that lack a Webex title.
 func icsTitleForMeeting(start time.Time) string {
 	home, err := os.UserHomeDir()
@@ -635,18 +636,22 @@ func icsTitleForMeeting(start time.Time) string {
 		"united_states_holidays": true,
 		"us_holidays":            true,
 	}
+	// Collect all candidates within the window and return the closest match.
+	bestTitle := ""
+	bestDiff := time.Duration(1<<62 - 1)
 	for _, d := range dirs {
 		if !d.IsDir() || skipCals[strings.ToLower(d.Name())] {
 			continue
 		}
 		matches, _ := filepath.Glob(filepath.Join(calRoot, d.Name(), prefix+"_*.ics"))
 		for _, path := range matches {
-			if title, ok := icsParseTitle(path, start); ok {
-				return title
+			if title, diff, ok := icsParseTitleDiff(path, start); ok && diff < bestDiff {
+				bestTitle = title
+				bestDiff = diff
 			}
 		}
 	}
-	return ""
+	return bestTitle
 }
 
 // icsCountTitle counts how many ICS events across all available months in
@@ -702,18 +707,25 @@ func icsCountTitle(title string) int {
 }
 
 // icsParseTitle returns the SUMMARY of an ICS file if its DTSTART is within
-// ±30 minutes of target, otherwise ("", false).
+// ±20 minutes of target, otherwise ("", false).
 func icsParseTitle(path string, target time.Time) (string, bool) {
+	title, _, ok := icsParseTitleDiff(path, target)
+	return title, ok
+}
+
+// icsParseTitleDiff returns the SUMMARY and time delta of an ICS file if its
+// DTSTART is within ±20 minutes of target, otherwise ("", 0, false).
+func icsParseTitleDiff(path string, target time.Time) (string, time.Duration, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	text := string(data)
 
 	dtm := icsDTStartRe.FindStringSubmatch(text)
 	summ := icsSummaryRe.FindStringSubmatch(text)
 	if dtm == nil || summ == nil {
-		return "", false
+		return "", 0, false
 	}
 
 	raw := strings.TrimSpace(dtm[1])
@@ -721,7 +733,6 @@ func icsParseTitle(path string, target time.Time) (string, bool) {
 	for _, layout := range []string{"20060102T150405Z", "20060102T150405", "20060102"} {
 		if parsed, err2 := time.Parse(layout, raw); err2 == nil {
 			if strings.HasSuffix(raw, "Z") {
-				// Explicit UTC timestamp.
 				t = parsed.UTC()
 			} else {
 				// No timezone indicator — Outlook exports local time without Z.
@@ -733,21 +744,20 @@ func icsParseTitle(path string, target time.Time) (string, bool) {
 		}
 	}
 	if t.IsZero() {
-		return "", false
+		return "", 0, false
 	}
 	diff := t.Sub(target)
 	if diff < 0 {
 		diff = -diff
 	}
-	if diff > 30*time.Minute {
-		return "", false
+	if diff > 20*time.Minute {
+		return "", 0, false
 	}
 
 	title := strings.TrimSpace(summ[1])
-	// Unescape ICS backslash sequences.
 	title = strings.NewReplacer(`\,`, ",", `\;`, ";", `\n`, " ", `\\`, `\`).Replace(title)
 	if title == "" {
-		return "", false
+		return "", 0, false
 	}
-	return title, true
+	return title, diff, true
 }

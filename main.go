@@ -108,6 +108,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	debug := flag.Bool("debug", false, "Print raw transcript list with roomId and space type before uploading")
 	reroute := flag.Bool("reroute", false, "Re-upload all transcripts regardless of manifest, to correct folder routing")
+	purgeID   := flag.String("purge-id", "", "Remove a transcript ID from the Drive manifest and local DB so it can be re-fetched and re-uploaded")
 	dryRun    := flag.Bool("dry-run", false, "List transcripts that would be downloaded and the Drive folder each would land in, without writing anything")
 	local     := flag.Bool("local", true, "Save transcripts to local markdown files instead of uploading to Google Docs (skips Google auth); default true")
 	drive     := flag.Bool("drive", false, "Upload transcripts to Google Docs (overrides --local)")
@@ -124,7 +125,7 @@ func main() {
 	notifySpace      := flag.Bool("notify-space", false, "After scheduling, post a meeting-info message to the space as yourself (requires --space-name or --space-id)")
 
 	// Advanced flags hidden from default --help output.
-	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true}
+	advanced := map[string]bool{"client-id": true, "client-secret": true, "help-advanced": true, "debug": true, "reroute": true, "purge-id": true}
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of webex-scribe:\n")
 		flag.VisitAll(func(f *flag.Flag) {
@@ -284,8 +285,18 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Ensuring Drive folder structure (%s/{1-1s,recurring,standalone}/<space>)...\n", rootFolderName)
-	rootFolderID, err := ensureFolder(ctx, clients.drive, rootFolderName, "root")
+	// Authenticate Webex before creating Drive folders so we can derive the
+	// per-user folder name from the account email.
+	webexClient, err := newWebexClient(ctx, *clientID, *clientSecret, *admin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	driveRootName := rootFolderName(webexClient.CurrentUserEmail())
+	migrateRootFolder(ctx, clients.drive, rootFolderBase, driveRootName, "root")
+
+	fmt.Printf("Ensuring Drive folder structure (%s/{1-1s,recurring,standalone}/<space>)...\n", driveRootName)
+	rootFolderID, err := ensureFolder(ctx, clients.drive, driveRootName, "root")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -306,7 +317,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load the deduplication manifest from the webex-meetings Drive folder so
+	// Load the deduplication manifest from the per-user Drive folder so
 	// state is shared across machines.
 	mf, err := loadDriveManifest(ctx, clients.drive, rootFolderID)
 	if err != nil {
@@ -315,10 +326,11 @@ func main() {
 	}
 	fmt.Printf("Manifest loaded: %d previously uploaded transcript(s).\n\n", len(mf.entries))
 
-	webexClient, err := newWebexClient(ctx, *clientID, *clientSecret, *admin)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	// Purge mode: remove a single transcript ID from the Drive manifest and
+	// local DB so the next run re-fetches and re-uploads it correctly.
+	if *purgeID != "" {
+		runPurgeID(ctx, mf, *outputDir, *purgeID)
+		return
 	}
 
 	fmt.Print("Listing transcripts")
@@ -429,9 +441,99 @@ func main() {
 	currentUserEmail := webexClient.CurrentUserEmail()
 	currentUserDisplayName := webexClient.CurrentUserDisplayName()
 
-	// Process each new transcript one at a time: download → classify → write to
-	// disk → nil Content/AISummary. LocalPath is set so Drive upload reads from disk.
-	var transcripts []Transcript
+	total := len(toDownload) + len(fromLocal)
+	if total == 0 {
+		fmt.Println("No transcripts could be downloaded.")
+		return
+	}
+
+	const workers = 3
+	fmt.Printf("\nUploading %d transcript(s) to Google Docs (%d parallel workers)...\n\n", total, workers)
+	uploadStart := time.Now()
+
+	type uploadResult struct {
+		t             Transcript
+		transcriptURL string
+		summaryURL    string
+		duration      time.Duration
+		err           error
+	}
+
+	// work is small-buffered so the download loop blocks when all workers are
+	// busy, bounding in-flight memory to workers transcripts at a time.
+	work := make(chan Transcript, workers)
+	results := make(chan uploadResult, total)
+
+	var (
+		mu           sync.Mutex
+		startedCount int
+	)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range work {
+				mu.Lock()
+				startedCount++
+				n := startedCount
+				elapsed := time.Since(uploadStart).Round(time.Second)
+				fmt.Printf("  [upload] [%d/%d +%s] %s (%s)\n",
+					n, total, elapsed, t.MeetingTitle, t.StartTime.Format("Jan 2"))
+				mu.Unlock()
+
+				t0 := time.Now()
+				var targetFolderID string
+				switch t.Category {
+				case Category1on1:
+					targetFolderID = oneOnOneFolderID
+				case CategoryRecurring:
+					targetFolderID = recurringFolderID
+				default:
+					targetFolderID = oneOffFolderID
+				}
+				tURL, sURL, err := createMeetingDocs(ctx, clients, targetFolderID, t, t.LocalFolderName)
+				results <- uploadResult{t: t, transcriptURL: tURL, summaryURL: sURL, duration: time.Since(t0), err: err}
+			}
+		}()
+	}
+
+	// Drain results in a separate goroutine so the main goroutine can keep
+	// submitting work without blocking on result consumption.
+	var uploaded int
+	var resultsMu sync.Mutex
+	var resultsDone = make(chan struct{})
+	go func() {
+		defer close(resultsDone)
+		for r := range results {
+			elapsed := time.Since(uploadStart).Round(time.Second)
+			resultsMu.Lock()
+			if r.err != nil {
+				fmt.Fprintf(os.Stderr, "  [error]  +%s  %s: %v\n", elapsed, r.t.MeetingTitle, r.err)
+			} else {
+				if err := mf.record(ctx, r.t, r.transcriptURL, r.summaryURL); err != nil {
+					fmt.Fprintf(os.Stderr, "  warning: could not update manifest for %q: %v\n", r.t.MeetingTitle, err)
+				}
+				fmt.Printf("  [done]   +%s  [%s] %s (%s) — took %s\n    transcript: %s\n",
+					elapsed, r.t.Category, r.t.MeetingTitle, r.t.StartTime.Format("Jan 2, 2006"),
+					r.duration.Round(time.Millisecond), r.transcriptURL)
+				if r.summaryURL != "" {
+					fmt.Printf("    summary:    %s\n", r.summaryURL)
+				}
+				uploaded++
+			}
+			resultsMu.Unlock()
+		}
+	}()
+
+	// fromLocal transcripts are already on disk — submit immediately.
+	for _, t := range fromLocal {
+		fmt.Printf("  [classify] %s → %s (from DB)\n", t.MeetingTitle, t.Category)
+		work <- t
+	}
+
+	// New transcripts: download → classify → write to disk → submit to workers.
 	if len(toDownload) > 0 {
 		fmt.Printf("\nFetching and saving %d new transcript(s) from Webex...\n", len(toDownload))
 	}
@@ -481,98 +583,13 @@ func main() {
 		if err := localMf.record(t.ID, entry); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: local manifest update failed for %q: %v\n", t.MeetingTitle, err)
 		}
-		transcripts = append(transcripts, t)
-	}
-	transcripts = append(fromLocal, transcripts...)
-
-	if len(transcripts) == 0 {
-		fmt.Println("No transcripts could be downloaded.")
-		return
+		work <- t // submit immediately after disk write; blocks if workers are busy
 	}
 
-	total := len(transcripts)
-	const workers = 3
-	fmt.Printf("\nUploading %d transcript(s) to Google Docs (%d parallel workers)...\n\n", total, workers)
-	uploadStart := time.Now()
-
-	type uploadResult struct {
-		t             Transcript
-		transcriptURL string
-		summaryURL    string
-		duration      time.Duration
-		err           error
-	}
-
-	work := make(chan Transcript, total)
-	results := make(chan uploadResult, total)
-
-	// mu serialises start-line output from the worker goroutines.
-	var (
-		mu           sync.Mutex
-		startedCount int
-	)
-
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for t := range work {
-				mu.Lock()
-				startedCount++
-				n := startedCount
-				waiting := total - n
-				elapsed := time.Since(uploadStart).Round(time.Second)
-				waitStr := ""
-				if waiting > 0 {
-					waitStr = fmt.Sprintf("  (%d waiting)", waiting)
-				}
-				fmt.Printf("  [upload] [%d/%d +%s] %s (%s)%s\n",
-					n, total, elapsed, t.MeetingTitle, t.StartTime.Format("Jan 2"), waitStr)
-				mu.Unlock()
-
-				t0 := time.Now()
-				var targetFolderID string
-				switch t.Category {
-				case Category1on1:
-					targetFolderID = oneOnOneFolderID
-				case CategoryRecurring:
-					targetFolderID = recurringFolderID
-				default:
-					targetFolderID = oneOffFolderID
-				}
-				tURL, sURL, err := createMeetingDocs(ctx, clients, targetFolderID, t, t.LocalFolderName)
-				results <- uploadResult{t: t, transcriptURL: tURL, summaryURL: sURL, duration: time.Since(t0), err: err}
-			}
-		}()
-	}
-	for _, t := range transcripts {
-		work <- t
-	}
 	close(work)
-
-	// Close results once all workers are done so the range below terminates.
-	go func() { wg.Wait(); close(results) }()
-
-	// Print results inline as they arrive so progress is visible in real time.
-	var uploaded int
-	for r := range results {
-		elapsed := time.Since(uploadStart).Round(time.Second)
-		if r.err != nil {
-			fmt.Fprintf(os.Stderr, "  [error]  +%s  %s: %v\n", elapsed, r.t.MeetingTitle, r.err)
-			continue
-		}
-		if err := mf.record(ctx, r.t, r.transcriptURL, r.summaryURL); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not update manifest for %q: %v\n", r.t.MeetingTitle, err)
-		}
-		fmt.Printf("  [done]   +%s  [%s] %s (%s) — took %s\n    transcript: %s\n",
-			elapsed, r.t.Category, r.t.MeetingTitle, r.t.StartTime.Format("Jan 2, 2006"),
-			r.duration.Round(time.Millisecond), r.transcriptURL)
-		if r.summaryURL != "" {
-			fmt.Printf("    summary:    %s\n", r.summaryURL)
-		}
-		uploaded++
-	}
+	wg.Wait()
+	close(results)
+	<-resultsDone
 
 	fmt.Printf("\nDone! Uploaded: %d  Skipped (already uploaded): %d  Total time: %s\n",
 		uploaded, skipped, time.Since(uploadStart).Round(time.Second))
@@ -605,25 +622,26 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 		os.Exit(1)
 	}
 
-	rootFolderID, err := ensureFolder(ctx, clients.drive, rootFolderName, "root")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error ensuring Drive root folder: %v\n", err)
-		os.Exit(1)
-	}
-
-	mf, err := loadDriveManifest(ctx, clients.drive, rootFolderID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not load manifest (treating all as new): %v\n", err)
-		mf = &driveManifest{entries: make(map[string]manifestEntry), drive: clients.drive, folderID: rootFolderID}
-	}
-	fmt.Printf("Manifest loaded: %d previously uploaded transcript(s).\n\n", len(mf.entries))
-
 	fmt.Println("Authenticating with Webex (dry-run)...")
 	webexClient, err := newWebexClient(ctx, clientID, clientSecret, admin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+
+	driveRootName := rootFolderName(webexClient.CurrentUserEmail())
+	migrateRootFolder(ctx, clients.drive, rootFolderBase, driveRootName, "root")
+	rootFolderID, err := ensureFolder(ctx, clients.drive, driveRootName, "root")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error ensuring Drive root folder: %v\n", err)
+		os.Exit(1)
+	}
+	mf, err := loadDriveManifest(ctx, clients.drive, rootFolderID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not load manifest (treating all as new): %v\n", err)
+		mf = &driveManifest{entries: make(map[string]manifestEntry), drive: clients.drive, folderID: rootFolderID}
+	}
+	fmt.Printf("Manifest loaded: %d previously uploaded transcript(s).\n\n", len(mf.entries))
 
 	fmt.Print("Listing transcripts")
 	if from != "" || to != "" {
@@ -726,7 +744,7 @@ func runDryRun(ctx context.Context, clientID, clientSecret string, admin bool, f
 			subFolder = spaceName
 		}
 
-		folderPath := fmt.Sprintf("%s/%s/%s", rootFolderName, cat.DriveFolder(), subFolder)
+		folderPath := fmt.Sprintf("%s/%s/%s", driveRootName, cat.DriveFolder(), subFolder)
 		titleTrunc := item.MeetingTopic
 		if len(titleTrunc) > 35 {
 			titleTrunc = titleTrunc[:32] + "..."
@@ -1201,4 +1219,54 @@ func runSendMessageMode(ctx context.Context, clientID, clientSecret, message, sp
 		os.Exit(1)
 	}
 	fmt.Println("Message sent.")
+}
+
+// runPurgeID removes a single transcript ID from the Drive manifest and local
+// DB so the next --drive run re-fetches and re-uploads it from scratch.
+// Use when a transcript was misclassified and needs to be corrected.
+func runPurgeID(ctx context.Context, mf *driveManifest, outputDir, id string) {
+	entry, ok := mf.entries[id]
+	if !ok {
+		fmt.Printf("ID %q not found in Drive manifest — nothing to remove.\n", id)
+	} else {
+		delete(mf.entries, id)
+		if err := mf.save(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "error saving Drive manifest: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Removed from Drive manifest: %q (%s)\n", entry.Title, entry.MeetingDate)
+	}
+
+	lm := loadLocalManifest(outputDir)
+	defer lm.close()
+
+	var transcriptPath string
+	lm.db.QueryRow("SELECT transcript_path FROM transcripts WHERE transcript_id = ?", id).Scan(&transcriptPath)
+
+	if _, err := lm.db.Exec("DELETE FROM participants WHERE transcript_id = ?", id); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not delete participants: %v\n", err)
+	}
+	res, err := lm.db.Exec("DELETE FROM transcripts WHERE transcript_id = ?", id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error deleting from local DB: %v\n", err)
+		os.Exit(1)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		fmt.Printf("Removed from local DB: %s\n", id)
+	} else {
+		fmt.Printf("ID %q not found in local DB.\n", id)
+	}
+
+	if transcriptPath != "" {
+		dir := filepath.Dir(transcriptPath)
+		base := strings.TrimSuffix(filepath.Base(transcriptPath), "-transcript.md")
+		for _, suffix := range []string{"-transcript.md", "-summary.md", "-meeting-info.json"} {
+			p := filepath.Join(dir, base+suffix)
+			if err := os.Remove(p); err == nil {
+				fmt.Printf("Deleted: %s\n", p)
+			}
+		}
+	}
+
+	fmt.Println("Done — run webex-scribe --drive to re-fetch and re-upload.")
 }
